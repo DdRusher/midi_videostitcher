@@ -14,7 +14,7 @@ if errorlevel 1 (
     echo Python 缺少 Tcl/Tk 组件，请重新运行 Python 安装程序添加该组件。
     goto failed
 )
-".venv\Scripts\python.exe" -c "import mido, imageio_ffmpeg" >nul 2>&1
+".venv\Scripts\python.exe" -c "import mido, imageio_ffmpeg, numpy, PIL" >nul 2>&1
 if errorlevel 1 (
     echo 正在安装运行所需组件...
     ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt

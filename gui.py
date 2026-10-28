@@ -14,9 +14,11 @@ import tkinter as tk
 from tkinter import filedialog, font, messagebox, ttk
 from typing import Callable
 
-from notes import MidiData, load_midi
+from notes import MidiData, load_midi, note_name
+from material_selection import MaterialSelection, material_windows
 from preview_player import PreviewPlayer
-from renderer import RenderOptions, find_ffmpeg, render_midi, render_preview_audio, validate_assets
+from renderer import (RenderOptions, find_ffmpeg, inspect_materials, render_audio,
+                      render_midi, render_preview_audio, validate_assets)
 from selection import parse_time, select_midi
 
 RESOLUTIONS = {
@@ -30,6 +32,10 @@ CHORD_POLICIES = {
     "只保留最低音": "lowest",
     "只保留最后进入的音符": "latest",
 }
+
+VIDEO_MODES = {"音名 / 频率 / 力度（快速）": "labels", "视频素材分屏": "clips"}
+SOUND_SOURCES = ("素材原声", "导入整段音频")
+MATERIAL_MODES = {"固定起点": "fixed", "随机选段": "random"}
 
 
 def _duration_text(seconds: float) -> str:
@@ -81,6 +87,11 @@ class StitcherApp(tk.Tk):
         self._preview_job_path: Path | None = None
         self._discard_paths: set[Path] = set()
         self._cleanup_after_id: str | None = None
+        self._material_selections: dict[int, MaterialSelection] = {}
+        self._material_info = {}
+        self._material_edit_pitch: int | None = None
+        self._material_dirty = False
+        self._material_loading = False
         self.midi_path = tk.StringVar()
         self.video_dir = tk.StringVar()
         self.output_path = tk.StringVar()
@@ -90,6 +101,16 @@ class StitcherApp(tk.Tk):
         self.resolution = tk.StringVar(value=next(iter(RESOLUTIONS)))
         self.fps = tk.StringVar(value="30")
         self.chord_policy = tk.StringVar(value=next(iter(CHORD_POLICIES)))
+        self.video_mode = tk.StringVar(value=next(iter(VIDEO_MODES)))
+        self.sound_source = tk.StringVar(value=SOUND_SOURCES[0])
+        self.audio_path = tk.StringVar()
+        self.respect_velocity = tk.BooleanVar(value=True)
+        self.random_seed = tk.StringVar(value="0")
+        self.material_mode = tk.StringVar(value=next(iter(MATERIAL_MODES)))
+        self.material_start = tk.StringVar(value="0")
+        self.material_end = tk.StringVar(value="")
+        self.material_hint = tk.StringVar(value="检查素材后，可为每个音高选择素材区间。")
+        self.velocity_hint = tk.StringVar(value="按 MIDI 力度控制原声音量：127＝原音量，64≈一半；画面同时显示力度。")
         self.summary = tk.StringVar(value="选择 MIDI 后，可选择多个轨道和时间范围。")
         self.asset_summary = tk.StringVar(value="素材命名示例：C4.mp4、C#4.mp4、60.mp4。")
         self.status = tk.StringVar(value="准备就绪")
@@ -100,7 +121,12 @@ class StitcherApp(tk.Tk):
         self.video_dir.trace_add("write", self._on_assets_edit)
         for variable in (self.start_time, self.end_time, self.channel_choice):
             variable.trace_add("write", self._on_range_edit)
-        for variable in (self.output_path, self.resolution, self.fps, self.chord_policy):
+        self.audio_path.trace_add("write", self._on_audio_path_edit)
+        self.sound_source.trace_add("write", self._on_sound_source_edit)
+        for variable in (self.material_mode, self.material_start, self.material_end):
+            variable.trace_add("write", self._on_material_editor_edit)
+        for variable in (self.output_path, self.resolution, self.fps, self.chord_policy,
+                         self.video_mode, self.respect_velocity, self.random_seed):
             variable.trace_add("write", self._on_config_edit)
         self._poll_after_id = self.after(80, self._poll_events)
 
@@ -156,29 +182,32 @@ class StitcherApp(tk.Tk):
         footer.pack(side="bottom", fill="x")
         footer.columnconfigure(0, weight=1)
         status_row = ttk.Frame(footer, style="Card.TFrame")
-        status_row.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 5))
+        status_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 5))
         status_row.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(status_row, textvariable=self.status, style="Status.TLabel")
         self.status_label.grid(row=0, column=0, sticky="w")
         ttk.Label(status_row, textvariable=self.percent, style="Muted.TLabel").grid(
             row=0, column=1, sticky="e", padx=(8, 0))
         self.progress = ttk.Progressbar(footer, mode="determinate", maximum=1)
-        self.progress.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 8))
+        self.progress.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 8))
         self.preview_button = self._track_control(ttk.Button(
-            footer, text="试听所选片段原声", command=self._start_preview))
+            footer, text="试听选区音频", command=self._start_preview))
         self.preview_button.grid(row=2, column=0, sticky="w")
         self.stop_preview_button = ttk.Button(
             footer, text="停止试听", command=self._stop_preview, state="disabled")
         self.stop_preview_button.grid(row=2, column=1, padx=(8, 16))
         self.open_video_button = ttk.Button(
-            footer, text="播放成片", command=self._open_result, state="disabled")
-        self.open_video_button.grid(row=2, column=2, padx=(0, 8))
+            footer, text="打开结果", command=self._open_result, state="disabled")
+        self.audio_export_button = self._track_control(ttk.Button(
+            footer, text="仅导出音频", command=self._start_audio_export))
+        self.audio_export_button.grid(row=2, column=2, padx=(0, 8))
+        self.open_video_button.grid(row=2, column=3, padx=(0, 8))
         self.cancel_button = ttk.Button(
             footer, text="取消任务", command=self._cancel_job, state="disabled")
-        self.cancel_button.grid(row=2, column=3, padx=(0, 8))
+        self.cancel_button.grid(row=2, column=4, padx=(0, 8))
         self.export_button = self._track_control(ttk.Button(
-            footer, text="导出所选片段", style="Accent.TButton", command=self._start_export))
-        self.export_button.grid(row=2, column=4)
+            footer, text="导出视频", style="Accent.TButton", command=self._start_export))
+        self.export_button.grid(row=2, column=5)
 
         viewport = ttk.Frame(self)
         viewport.pack(fill="both", expand=True)
@@ -198,12 +227,21 @@ class StitcherApp(tk.Tk):
         heading = ttk.Frame(outer)
         heading.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(heading, text="MIDI 视频拼接器", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(heading, text="选轨道、截取片段、试听原声，再把重叠音符拼成分屏视频。",
+        ttk.Label(heading, text="选择素材片段、保留 MIDI 力度，导出音频或分屏视频。",
                   style="Subtitle.TLabel").pack(anchor="w", pady=(3, 0))
         files = self._card(outer, 1, "01  选择文件")
         self.midi_entry = self._path_row(files, 1, "MIDI 文件", self.midi_path, self._browse_midi)
-        self._path_row(files, 2, "视频素材目录", self.video_dir, self._browse_videos)
+        self._path_row(files, 2, "素材目录", self.video_dir, self._browse_videos)
         self._path_row(files, 3, "保存成片", self.output_path, self._browse_output)
+        self._path_row(files, 4, "导入音频", self.audio_path, self._browse_audio)
+        sound_row = ttk.Frame(files, style="Card.TFrame")
+        sound_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(sound_row, text="声音来源").pack(side="left", padx=(0, 10))
+        self._track_control(ttk.Combobox(
+            sound_row, textvariable=self.sound_source, values=SOUND_SOURCES, width=15,
+            state="readonly"), "readonly").pack(side="left")
+        ttk.Label(sound_row, text="导入音频与 MIDI 的 0 秒对齐，选区自动截取对应位置。",
+                  style="Muted.TLabel").pack(side="left", padx=(12, 0))
 
         selection = self._card(outer, 2, "02  选择轨道与时间范围")
         selection.columnconfigure(0, weight=3)
@@ -257,7 +295,7 @@ class StitcherApp(tk.Tk):
         timeline_bar = ttk.Frame(selection, style="Card.TFrame")
         timeline_bar.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 2))
         timeline_bar.columnconfigure(0, weight=1)
-        ttk.Label(timeline_bar, text="拖动蓝色边界调整选区；柱形表示所选轨道的音符分布。",
+        ttk.Label(timeline_bar, text="拖动蓝色边界调整选区；柱形表示音符密度与力度。",
                   style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         self.whole_song_button = self._track_control(ttk.Button(
             timeline_bar, text="选取全曲", command=self._reset_range))
@@ -282,7 +320,8 @@ class StitcherApp(tk.Tk):
             selection, text="检查所选素材", command=self._check_assets))
         self.check_button.grid(row=6, column=3, sticky="e", padx=(8, 0), pady=(6, 0))
 
-        export = self._card(outer, 3, "03  画面设置")
+        self._build_material_widgets(outer, 3)
+        export = self._card(outer, 4, "04  画面与声音设置")
         settings = ttk.Frame(export, style="Card.TFrame")
         settings.grid(row=1, column=0, columnspan=4, sticky="ew")
         ttk.Label(settings, text="画面").grid(row=0, column=0, padx=(0, 6))
@@ -297,19 +336,30 @@ class StitcherApp(tk.Tk):
         self._track_control(ttk.Combobox(
             settings, textvariable=self.chord_policy, values=list(CHORD_POLICIES),
             state="readonly", width=24), "readonly").grid(row=0, column=5, sticky="w")
+        mode_row = ttk.Frame(export, style="Card.TFrame")
+        mode_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(mode_row, text="画面模式").pack(side="left", padx=(0, 8))
+        self._track_control(ttk.Combobox(
+            mode_row, textvariable=self.video_mode, values=list(VIDEO_MODES),
+            state="readonly", width=29), "readonly").pack(side="left")
+        self.velocity_checkbox = self._track_control(ttk.Checkbutton(
+            mode_row, text="按 MIDI 力度控制音量", variable=self.respect_velocity))
+        self.velocity_checkbox.pack(side="left", padx=(18, 0))
+        ttk.Label(export, textvariable=self.velocity_hint, style="Muted.TLabel", wraplength=760).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.render_hint = ttk.Label(
-            export, text="重叠几个音符就显示几格视频，并叠加素材原声；休止保留黑屏，短素材循环。\n"
-                         "试听会播放完整选区的素材原声，不合成 MIDI 音色。极短音符受帧率限制。",
+            export, text="视频素材模式自动分屏并叠加原声；快速模式直接显示音名、频率和力度。\n"
+                         "导入整段音频时保留音乐本身的强弱。试听与导出共用同一选段和随机结果。",
             style="Muted.TLabel", wraplength=800)
-        self.render_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        log_card = self._card(outer, 4, "运行记录")
+        self.render_hint.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        log_card = self._card(outer, 5, "运行记录")
         log_card.rowconfigure(1, weight=1)
         self.log_text = tk.Text(log_card, height=2, wrap="word", relief="flat",
                                 background="#ffffff", foreground="#718097",
                                 font=("Microsoft YaHei UI", 9), state="disabled", takefocus=False)
         self.log_text.grid(row=1, column=0, columnspan=4, sticky="nsew")
         bottom = ttk.Frame(outer)
-        bottom.grid(row=5, column=0, sticky="ew")
+        bottom.grid(row=6, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         ttk.Label(bottom, text="音名以 C4＝MIDI 60 为准", style="Subtitle.TLabel").grid(
             row=0, column=0, sticky="w")
@@ -318,6 +368,203 @@ class StitcherApp(tk.Tk):
         self.open_folder_button.grid(row=0, column=1)
         self._restore_controls()
         self._draw_timeline()
+
+    def _build_material_widgets(self, outer, row) -> None:
+        first_control = len(self._controls)
+        card = self._card(outer, row, "03  为每种素材选择片段")
+        table_frame = ttk.Frame(card, style="Card.TFrame")
+        table_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        columns = ("note", "duration", "needed", "mode", "start", "end")
+        self.material_table = ttk.Treeview(table_frame, columns=columns, show="headings",
+                                           height=4, selectmode="browse")
+        for column, title, width in zip(columns,
+                ("音名", "素材时长(s)", "MIDI 最长(s)", "选段方式", "区间起点(s)", "区间终点(s)"),
+                (70, 108, 108, 108, 108, 108)):
+            self.material_table.heading(column, text=title)
+            self.material_table.column(column, width=width, minwidth=65, stretch=True, anchor="center")
+        self.material_table.grid(row=0, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.material_table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.material_table.configure(yscrollcommand=scroll.set)
+        self.material_table.bind("<<TreeviewSelect>>", self._material_row_selected)
+        editor = ttk.Frame(card, style="Card.TFrame")
+        editor.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(editor, text="选中音高").grid(row=0, column=0, padx=(0, 8))
+        self._track_control(ttk.Combobox(editor, textvariable=self.material_mode,
+            values=list(MATERIAL_MODES), state="readonly", width=10), "readonly").grid(row=0, column=1)
+        ttk.Label(editor, text="从").grid(row=0, column=2, padx=(12, 6))
+        self._track_control(ttk.Entry(editor, textvariable=self.material_start, width=9)).grid(row=0, column=3)
+        ttk.Label(editor, text="到").grid(row=0, column=4, padx=6)
+        self._track_control(ttk.Entry(editor, textvariable=self.material_end, width=9)).grid(row=0, column=5)
+        ttk.Label(editor, text="秒；结束留空＝素材末尾", style="Muted.TLabel").grid(
+            row=0, column=6, padx=(8, 0))
+        actions = ttk.Frame(card, style="Card.TFrame")
+        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self._track_control(ttk.Button(actions, text="应用此音高",
+            command=self._apply_material_selection)).pack(side="left")
+        self._track_control(ttk.Button(actions, text="应用所有音高",
+            command=lambda: self._apply_material_selection(all_pitches=True))).pack(side="left", padx=6)
+        self._track_control(ttk.Button(actions, text="恢复此音高整段",
+            command=self._reset_material_selection)).pack(side="left")
+        ttk.Label(actions, text="随机种子").pack(side="left", padx=(18, 6))
+        self._track_control(ttk.Entry(actions, textvariable=self.random_seed, width=8)).pack(side="left")
+        self._track_control(ttk.Button(actions, text="换一批随机片段",
+            command=self._reroll_random)).pack(side="left", padx=(6, 0))
+        ttk.Label(card, textvariable=self.material_hint, style="Muted.TLabel", wraplength=760).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Label(card, text="固定：从区间起点开始；随机：在区间内挑选足够长的一段。音符更长时只循环所选区间。",
+                  style="Muted.TLabel", wraplength=760).grid(row=5, column=0, columnspan=4, sticky="w", pady=(3, 0))
+        self._material_controls = list(self._controls[first_control:])
+
+    def _uses_imported_audio(self) -> bool:
+        return self.sound_source.get() == SOUND_SOURCES[1]
+
+    def _browse_audio(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="导入与 MIDI 同步的音频",
+            filetypes=[("音频文件", "*.wav *.mp3 *.flac *.m4a *.aac *.ogg *.opus *.mp4"), ("所有文件", "*")])
+        if path:
+            self.audio_path.set(path)
+
+    def _on_audio_path_edit(self, *_args) -> None:
+        if self._busy or self._suspend_changes:
+            return
+        if self.audio_path.get().strip():
+            self._suspend_changes = True
+            try:
+                self.sound_source.set(SOUND_SOURCES[1])
+                self.video_mode.set(next(label for label, value in VIDEO_MODES.items() if value == "labels"))
+            finally:
+                self._suspend_changes = False
+        self._on_sound_source_edit()
+
+    def _on_sound_source_edit(self, *_args) -> None:
+        if self._busy or self._suspend_changes:
+            return
+        self._invalidate_preview()
+        if self._uses_imported_audio():
+            self.velocity_hint.set("导入音频保留音乐本身的强弱；MIDI 力度显示在画面中，不再次改变整段音乐音量。")
+        else:
+            self.velocity_hint.set("按 MIDI 力度控制原声音量：127＝原音量，64≈一半；画面同时显示力度。")
+        self._restore_controls()
+
+    def _on_material_editor_edit(self, *_args) -> None:
+        if not self._material_loading and not self._busy:
+            self._material_dirty = True
+            self._invalidate_preview()
+
+    def _refresh_material_table(self) -> None:
+        if "material_table" not in self.__dict__:
+            return
+        try:
+            data = self._selected_data()
+        except (OSError, ValueError):
+            data = None
+        needed = {}
+        if data is not None:
+            for note in data.notes:
+                needed[note.pitch] = max(needed.get(note.pitch, 0), note.duration + note.source_offset)
+        previous = self._material_edit_pitch
+        self.material_table.delete(*self.material_table.get_children())
+        for pitch in sorted(needed):
+            info = self._material_info.get(pitch)
+            selection = self._material_selections.get(pitch, MaterialSelection())
+            duration = getattr(info, "duration", None)
+            self.material_table.insert("", "end", iid=str(pitch), values=(note_name(pitch),
+                f"{duration:.3f}" if duration is not None else "待检查", f"{needed[pitch]:.3f}",
+                "随机选段" if selection.mode == "random" else "固定起点", f"{selection.start:g}",
+                f"{selection.end:g}" if selection.end is not None else "素材末尾"))
+        if needed:
+            pitch = previous if previous in needed else min(needed)
+            self.material_table.selection_set(str(pitch))
+            if not self._material_dirty or pitch != previous:
+                self._load_material_editor(pitch)
+        else:
+            self._material_edit_pitch = None
+            self._material_dirty = False
+        self.material_hint.set("点击一行编辑；检查素材后会显示实际时长。设置会用于试听和正式导出。")
+
+    def _load_material_editor(self, pitch: int) -> None:
+        selection = self._material_selections.get(pitch, MaterialSelection())
+        self._material_loading = True
+        try:
+            self._material_edit_pitch = pitch
+            self.material_mode.set(next(label for label, mode in MATERIAL_MODES.items() if mode == selection.mode))
+            self.material_start.set(f"{selection.start:g}")
+            self.material_end.set("" if selection.end is None else f"{selection.end:g}")
+            self._material_dirty = False
+        finally:
+            self._material_loading = False
+
+    def _material_row_selected(self, _event=None) -> None:
+        if self._busy or self._material_loading:
+            return
+        selected = self.material_table.selection()
+        if not selected:
+            return
+        pitch = int(selected[0])
+        if pitch == self._material_edit_pitch:
+            return
+        previous = self._material_edit_pitch
+        if self._material_dirty and previous is not None:
+            try:
+                self._save_material_editor([previous])
+            except ValueError as error:
+                messagebox.showerror("无法保存素材区间", str(error), parent=self)
+                self.material_table.selection_set(str(previous))
+                return
+        self._load_material_editor(pitch)
+
+    def _save_material_editor(self, pitches: list[int]) -> None:
+        start = parse_time(self.material_start.get().strip() or "0")
+        end_text = self.material_end.get().strip()
+        selection = MaterialSelection(start=start, end=parse_time(end_text) if end_text else None,
+                                      mode=MATERIAL_MODES[self.material_mode.get()])
+        durations = {}
+        for pitch in pitches:
+            info = self._material_info.get(pitch)
+            if info is None:
+                raise ValueError("请先点击“检查所选素材”读取素材时长，再选择片段。")
+            durations[pitch] = info.duration
+        material_windows({pitch: selection for pitch in pitches}, durations)
+        for pitch in pitches:
+            self._material_selections[pitch] = selection
+        self._material_dirty = False
+        self._invalidate_preview()
+
+    def _apply_material_selection(self, all_pitches: bool = False) -> None:
+        if self._busy:
+            return
+        try:
+            pitches = [int(item) for item in self.material_table.get_children()] if all_pitches else (
+                [self._material_edit_pitch] if self._material_edit_pitch is not None else [])
+            if not pitches:
+                raise ValueError("请先读取 MIDI 并选择要使用的音符。")
+            self._save_material_editor(pitches)
+        except (OSError, ValueError, KeyError) as error:
+            messagebox.showerror("无法设置素材区间", str(error), parent=self)
+            return
+        self._refresh_material_table()
+        self.status.set(f"已保存 {len(pitches)} 种音高的素材区间")
+
+    def _reset_material_selection(self) -> None:
+        if self._busy or self._material_edit_pitch is None:
+            return
+        self._material_selections.pop(self._material_edit_pitch, None)
+        self._invalidate_preview()
+        self._refresh_material_table()
+
+    def _reroll_random(self) -> None:
+        if self._busy:
+            return
+        try:
+            self.random_seed.set(str(int(self.random_seed.get().strip() or "0") + 1))
+        except ValueError:
+            self.random_seed.set("1")
+        random_active = self.material_mode.get() == "随机选段" or any(
+            choice.mode == "random" for choice in self._material_selections.values())
+        self.status.set("已更换随机种子，下次试听与导出将使用同一批新片段" if random_active else
+                        "随机种子已更新；把选段方式设为“随机选段”后即可使用")
 
     def _resize_content(self, _event=None) -> None:
         width = max(1, self._canvas.winfo_width())
@@ -334,7 +581,7 @@ class StitcherApp(tk.Tk):
             self.status_label.configure(wraplength=max(300, self.winfo_width()-110))
 
     def _scroll_content(self, event) -> None:
-        if isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Combobox)):
+        if isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Combobox, ttk.Treeview)):
             return
         if event.delta:
             self._canvas.yview_scroll((-1 if event.delta > 0 else 1) *
@@ -369,7 +616,7 @@ class StitcherApp(tk.Tk):
             self._read_midi()
 
     def _browse_videos(self) -> None:
-        path = filedialog.askdirectory(parent=self, title="选择按音名命名的视频素材目录")
+        path = filedialog.askdirectory(parent=self, title="选择按音名命名的视频或音频素材目录")
         if path:
             self.video_dir.set(path)
 
@@ -450,17 +697,24 @@ class StitcherApp(tk.Tk):
         self.summary.set("选择 MIDI 后，可选择多个轨道和时间范围。")
         self.asset_summary.set("请重新检查当前 MIDI 选区所需素材。")
         self._set_notes("")
+        self._refresh_material_table()
         self._draw_timeline()
         self._restore_controls()
 
     def _on_assets_edit(self, *_args) -> None:
         if not self._busy and not self._suspend_changes:
             self._invalidate_preview()
+            self._material_selections.clear()
+            self._material_info.clear()
+            self._material_edit_pitch = None
+            self._material_dirty = False
+            self._refresh_material_table()
             self.asset_summary.set("素材目录已更改，请重新检查当前选区所需素材。")
 
     def _on_config_edit(self, *_args) -> None:
         if not self._busy and not self._suspend_changes:
             self._invalidate_preview()
+            self._restore_controls()
 
     def _on_range_edit(self, *_args) -> None:
         if not self._busy and not self._suspend_changes:
@@ -471,7 +725,9 @@ class StitcherApp(tk.Tk):
             return
         self._invalidate_preview()
         self._refresh_summary()
+        self._refresh_material_table()
         self.asset_summary.set("轨道、通道或时间已更改，请重新检查选区所需素材。")
+        self._restore_controls()
 
     def _select_all_tracks(self) -> None:
         if not self._busy:
@@ -543,8 +799,10 @@ class StitcherApp(tk.Tk):
         actual_end = self._full_data.duration if end is None else min(end, self._full_data.duration)
         self.summary.set(f"选区 {_duration_text(start)}–{_duration_text(actual_end)}"
             f"   ·   {len(self._selected_tracks())} 个轨道   ·   成片 {_duration_text(data.duration)}"
-            f"   ·   {len(data.notes)} 个音符 / {len(pitches)} 种素材")
-        self._set_notes("选区所需音名："+"、".join(pitches[pitch] for pitch in sorted(pitches)))
+            f"   ·   {len(data.notes)} 个音符 / {len(pitches)} 种音高")
+        velocities = [event.velocity for event in data.notes]
+        self._set_notes("选区所需音名："+"、".join(pitches[pitch] for pitch in sorted(pitches))
+                        +f"\nMIDI 力度：{min(velocities)}–{max(velocities)} / 127（保留每个音符自己的强弱）")
         self._draw_timeline()
 
     def _draw_timeline(self) -> None:
@@ -575,7 +833,7 @@ class StitcherApp(tk.Tk):
         for event in self._full_data.notes:
             if event.track in chosen_tracks and (channel is None or event.channel == channel):
                 bucket = min(len(counts)-1, max(0, int(event.start/duration*len(counts))))
-                counts[bucket] += 1
+                counts[bucket] += event.velocity / 127
         maximum = max(counts, default=0)
         if maximum:
             step, baseline = (right-left)/len(counts), height-23
@@ -645,8 +903,20 @@ class StitcherApp(tk.Tk):
         if not self._busy and self._full_data is None:
             for widget in (self.track_list, self.channel_box, self.start_entry, self.end_entry,
                            self.all_tracks_button, self.clear_tracks_button,
-                           self.whole_song_button, self.check_button, self.preview_button):
+                           self.whole_song_button, self.check_button, self.preview_button,
+                           self.audio_export_button):
                 widget.configure(state="disabled")
+        no_materials = self._uses_imported_audio() and VIDEO_MODES[self.video_mode.get()] == "labels"
+        if "material_table" in self.__dict__:
+            self.material_table.state(["disabled"] if self._busy or self._closing or no_materials else ["!disabled"])
+        if no_materials:
+            for widget, _state in self.__dict__.get("_material_controls", []):
+                widget.configure(state="disabled")
+            self.material_hint.set("导入音频＋音名画面无需素材；素材选段设置不会改变这条音乐。")
+        else:
+            self.material_hint.set("点击一行编辑；检查素材后会显示实际时长。设置会用于试听和正式导出。")
+        if "velocity_checkbox" in self.__dict__ and self._uses_imported_audio():
+            self.velocity_checkbox.configure(state="disabled")
         self.cancel_button.configure(state="normal" if self._busy and not self._closing
             and not self._cancel.is_set() else "disabled")
         self.stop_preview_button.configure(
@@ -718,31 +988,84 @@ class StitcherApp(tk.Tk):
             return
         try:
             data = self._selected_data()
+            if self._uses_imported_audio() and VIDEO_MODES[self.video_mode.get()] == "labels":
+                self._render_options(Path(self.output_path.get().strip() or "output.mp4"))
+                self.asset_summary.set("导入音频＋音名画面模式无需按音高提供素材。")
+                self.status.set("MIDI 与导入音频已就绪，可以试听或导出")
+                return
             directory = self.video_dir.get().strip()
             if not directory:
-                raise ValueError("请选择视频素材目录。")
+                raise ValueError("请选择素材目录。")
             directory_path = Path(directory).expanduser().resolve()
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, KeyError) as error:
             messagebox.showerror("无法检查素材", str(error), parent=self)
             return
         self._stop_preview()
-        self.status.set("正在检查选区素材…")
+        self.status.set("正在读取选区素材时长…")
 
-        def work(_cancel, _report):
-            assets = validate_assets(data, directory_path)
-            find_ffmpeg()
-            return assets
+        def work(cancel, _report):
+            return inspect_materials(data, directory_path, cancel_event=cancel)
         self._start_job("check", work)
 
-    def _render_options(self, output_path: Path, overwrite: bool = False) -> RenderOptions:
+    def _render_options(self, output_path: Path, overwrite: bool = False, *, audio_only: bool = False) -> RenderOptions:
         directory = self.video_dir.get().strip()
-        if not directory:
-            raise ValueError("请选择视频素材目录。")
+        imported = self._uses_imported_audio()
+        mode = VIDEO_MODES[self.video_mode.get()]
+        if self._material_dirty and self._material_edit_pitch is not None and not (
+                imported and (mode == "labels" or audio_only)):
+            self._save_material_editor([self._material_edit_pitch])
+            self._refresh_material_table()
+        if not directory and not (imported and (mode == "labels" or audio_only)):
+            raise ValueError("请选择素材目录，或使用导入音频＋音名画面模式。")
+        audio = None
+        start, _end = self._time_bounds()
+        if imported:
+            value = self.audio_path.get().strip()
+            if not value:
+                raise ValueError("请选择要导入的音频文件。")
+            audio = Path(value).expanduser().resolve()
+            if not audio.is_file():
+                raise ValueError("导入的音频文件不存在，或不是一个文件。")
+        active_pitches = {note.pitch for note in self._selected_data().notes}
+        settings = {pitch: choice for pitch, choice in self._material_selections.items() if pitch in active_pitches}
         width, height = RESOLUTIONS[self.resolution.get()]
-        return RenderOptions(video_dir=Path(directory).expanduser().resolve(),
+        return RenderOptions(video_dir=Path(directory or ".").expanduser().resolve(),
             output_path=output_path, width=width, height=height, fps=int(self.fps.get()),
             chord_policy=CHORD_POLICIES[self.chord_policy.get()],
-            use_clip_audio=True, overwrite=overwrite)
+            use_clip_audio=True, overwrite=overwrite, audio_path=audio, audio_start=start if imported else 0.0,
+            video_mode=mode, respect_velocity=self.respect_velocity.get(),
+            material_selections=settings if not (imported and mode == "labels") else {},
+            random_seed=0 if imported and (mode == "labels" or audio_only) else
+                int(self.random_seed.get().strip() or "0"))
+
+    def _start_audio_export(self) -> None:
+        if self._busy:
+            return
+        try:
+            data = self._selected_data()
+            current = Path(self.output_path.get().strip() or "output.mp4")
+            chosen = filedialog.asksaveasfilename(parent=self, title="仅导出选区音频",
+                defaultextension=".wav", initialfile=current.stem+"_audio.wav",
+                initialdir=str(current.parent), filetypes=[("WAV 音频", "*.wav")], confirmoverwrite=False)
+            if not chosen:
+                return
+            path = Path(chosen).expanduser().resolve()
+            if path.suffix.lower() != ".wav" or path.is_dir():
+                raise ValueError("请选择包含文件名的 .wav 保存位置。")
+            overwrite = False
+            if path.exists():
+                overwrite = messagebox.askyesno("覆盖已有音频", f"文件已存在：\n{path}\n\n是否覆盖？", parent=self)
+                if not overwrite:
+                    return
+            options = self._render_options(path, overwrite, audio_only=True)
+        except (OSError, ValueError, KeyError) as error:
+            messagebox.showerror("无法导出音频", str(error), parent=self)
+            return
+        self._stop_preview()
+        self.status.set("正在导出选区音频…")
+        self._append_log(f"仅导出音频：{_duration_text(data.duration)}，{path.name}")
+        self._start_job("audio_export", lambda cancel, report: render_audio(
+            data, options, path, on_progress=report, cancel_event=cancel))
 
     def _start_export(self) -> None:
         if self._busy:
@@ -779,7 +1102,7 @@ class StitcherApp(tk.Tk):
         try:
             data = self._selected_data()
             preview_root = Path(self._preview_temp.name)
-            options = self._render_options(preview_root/"preview-source.mp4", overwrite=True)
+            options = self._render_options(preview_root/"preview-source.mp4", overwrite=True, audio_only=True)
         except (OSError, ValueError, KeyError) as error:
             messagebox.showerror("无法试听", str(error), parent=self)
             return
@@ -787,16 +1110,23 @@ class StitcherApp(tk.Tk):
         cached_path, cached_key = self._preview_path, self._preview_cache_key
         destination = preview_root/f"selection-{time.time_ns()}.wav"
         self._preview_job_path = destination
-        note_key = tuple((event.pitch, event.start, event.end, event.channel, event.track,
+        note_key = tuple((event.pitch, event.start, event.end, event.velocity, event.channel, event.track,
                           getattr(event, "source_offset", 0.0)) for event in data.notes)
-        base_key = (str(options.video_dir), options.fps, options.chord_policy, data.duration, note_key)
-        self.status.set("正在生成完整选区的原声试听…")
-        self._append_log(f"生成选区原声试听：{_duration_text(data.duration)}，可随时取消。")
+        materials_key = tuple(sorted((pitch, setting.start, setting.end, setting.mode)
+                                     for pitch, setting in (options.material_selections or {}).items()))
+        base_key = (str(options.video_dir), options.fps, options.chord_policy, data.duration, note_key,
+                    options.random_seed, options.respect_velocity, options.video_mode,
+                    options.audio_start, materials_key)
+        self.status.set("正在生成完整选区的音频试听…")
+        self._append_log(f"生成选区音频试听：{_duration_text(data.duration)}，可随时取消。")
 
         def work(cancel, report):
-            assets = validate_assets(data, options.video_dir)
+            if options.audio_path is not None:
+                sources = {-1: Path(options.audio_path)}
+            else:
+                sources = validate_assets(data, options.video_dir, allow_audio=True)
             asset_key = tuple(sorted((pitch, str(path), path.stat().st_size,
-                                      path.stat().st_mtime_ns) for pitch, path in assets.items()))
+                                      path.stat().st_mtime_ns) for pitch, path in sources.items()))
             key = base_key+(asset_key,)
             if cached_key == key and cached_path is not None and cached_path.is_file():
                 return cached_path, key
@@ -856,7 +1186,7 @@ class StitcherApp(tk.Tk):
         self._busy, self._job_kind = False, None
         if self._closing:
             return
-        if event_kind == "done" and self._cancel.is_set() and job_kind != "export":
+        if event_kind == "done" and self._cancel.is_set() and job_kind not in {"export", "audio_export"}:
             if job_kind == "preview":
                 self._discard_preview_job()
             self.status.set("任务已取消")
@@ -886,6 +1216,7 @@ class StitcherApp(tk.Tk):
             if tracks:
                 self.track_list.selection_set(0, "end")
                 self._refresh_summary()
+                self._refresh_material_table()
                 self.status.set("MIDI 已就绪，可调整选区、试听或导出")
                 self._append_log(f"读取成功：默认选中 {len(tracks)} 个轨道，全曲 "
                                  f"{_duration_text(data.duration)}。")
@@ -896,7 +1227,9 @@ class StitcherApp(tk.Tk):
             for warning in data.warnings:
                 self._append_log(f"提示：{warning}")
         elif job_kind == "check":
-            self.asset_summary.set(f"素材检查通过：已找到当前选区所需的 {len(payload)} 种音高视频。")
+            self._material_info.update(payload)
+            self._refresh_material_table()
+            self.asset_summary.set(f"素材检查通过：已找到当前选区所需的 {len(payload)} 种音高素材。")
             self.status.set("选区素材检查通过，可以试听或导出")
             self._append_log(self.asset_summary.get())
         elif job_kind == "preview":
@@ -917,15 +1250,16 @@ class StitcherApp(tk.Tk):
                 self._preview_active = True
                 self.progress.configure(value=1)
                 self.percent.set("100%")
-                self.status.set("正在试听所选片段原声；修改选区会立即停止")
-                self._append_log("开始播放完整选区的素材原声。")
-        elif job_kind == "export":
+                self.status.set("正在试听所选片段音频；修改设置会立即停止")
+                self._append_log("开始播放完整选区音频。")
+        elif job_kind in {"export", "audio_export"}:
             self._last_output = Path(payload)
             self.progress.configure(value=1)
             self.percent.set("100%")
             self.status.set("导出完成")
-            self._append_log(f"成片已保存：{self._last_output}")
-            messagebox.showinfo("导出完成", f"视频已保存：\n{self._last_output}", parent=self)
+            kind = "音频" if job_kind == "audio_export" else "视频"
+            self._append_log(f"{kind}已保存：{self._last_output}")
+            messagebox.showinfo("导出完成", f"{kind}已保存：\n{self._last_output}", parent=self)
         self._restore_controls()
 
     def _discard_preview_job(self) -> None:

@@ -243,6 +243,98 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(options.chord_policy, "all")
         self.assertIn(str(preview_path), output)
 
+    def test_imported_audio_defaults_to_cards_and_follows_the_midi_excerpt(self):
+        music = self.directory / "完整音乐.wav"
+        music.touch()
+        target = self.directory / "音名视频.mp4"
+        with patch("renderer.render_midi", return_value=target) as render:
+            code, _, error = self.run_command(
+                "--midi", str(self.midi_path), "--audio", str(music),
+                "--video-dir", str(self.directory / "没有素材也能导出"),
+                "--start", "0.2", "--end", "0.4", "--audio-offset", "0.3",
+                "--output", str(target))
+        self.assertEqual(code, 0, error)
+        data, options = render.call_args.args
+        self.assertAlmostEqual(data.duration, .2)
+        self.assertEqual(options.video_mode, "labels")
+        self.assertEqual(options.audio_path, music)
+        self.assertAlmostEqual(options.audio_start, .5)
+        self.assertTrue(options.respect_velocity)
+
+    def test_audio_only_uses_shared_mix_without_rendering_a_video(self):
+        target = self.directory / "仅音乐.wav"
+        with patch("renderer.render_audio", return_value=target) as audio, patch("renderer.render_midi") as video:
+            code, output, error = self.run_command(
+                "--midi", str(self.midi_path), "--video-dir", str(self.videos),
+                "--start", "0.1", "--end", "0.3", "--audio-only", str(target))
+        self.assertEqual(code, 0, error)
+        video.assert_not_called()
+        data, options, destination = audio.call_args.args
+        self.assertEqual(destination, target)
+        self.assertAlmostEqual(data.duration, .2)
+        self.assertTrue(options.respect_velocity)
+        self.assertIn(str(target), output)
+
+    def test_material_window_random_seed_and_velocity_options_reach_renderer(self):
+        target = self.directory / "片段.mp4"
+        with patch("renderer.render_midi", return_value=target) as render:
+            code, _, error = self.run_command(
+                "--midi", str(self.midi_path), "--material-window", "C4=1,3",
+                "--material-window", "D4=0.5,", "--random-material", "60",
+                "--random-seed", "42", "--ignore-velocity", "--visuals", "labels",
+                "--workers", "2", "--output", str(target))
+        self.assertEqual(code, 0, error)
+        _, options = render.call_args.args
+        self.assertEqual(options.material_selections[60].mode, "random")
+        self.assertEqual((options.material_selections[60].start, options.material_selections[60].end), (1, 3))
+        self.assertEqual(options.material_selections[62].mode, "fixed")
+        self.assertEqual((options.material_selections[62].start, options.material_selections[62].end), (.5, None))
+        self.assertEqual(options.random_seed, 42)
+        self.assertFalse(options.respect_velocity)
+        self.assertEqual(options.video_mode, "labels")
+        self.assertEqual(options.render_workers, 2)
+
+    def test_imported_audio_check_needs_no_source_materials(self):
+        music = self.directory / "完整音乐.wav"
+        music.touch()
+        code, output, error = self.check("--audio", str(music))
+        self.assertEqual(code, 0, error)
+        self.assertIn("无需视频素材", output)
+
+    def test_imported_audio_only_check_ignores_clip_visual_mode(self):
+        music = self.directory / "完整音乐.wav"
+        music.touch()
+        code, _, error = self.run_command(
+            "--midi", str(self.midi_path), "--audio", str(music), "--visuals", "clips",
+            "--audio-only", str(self.directory / "output.wav"),
+            "--video-dir", str(self.directory / "missing"), "--check")
+        self.assertEqual(code, 0, error)
+
+    def test_audio_material_names_work_for_label_mode(self):
+        self.add_materials("C4.wav", "D4.wav")
+        code, output, error = self.check("--visuals", "labels")
+        self.assertEqual(code, 0, error)
+        self.assertIn("C4.wav", output)
+        self.assertIn("D4.wav", output)
+
+    def test_all_random_is_applied_only_to_selected_midi_pitches(self):
+        target = self.directory / "随机片段.mp4"
+        with patch("renderer.render_midi", return_value=target) as render:
+            code, _, error = self.run_command("--midi", str(self.midi_path), "--channel", "2",
+                                             "--random-all", "--output", str(target))
+        self.assertEqual(code, 0, error)
+        self.assertEqual(set(render.call_args.args[1].material_selections), {62})
+        self.assertEqual(render.call_args.args[1].material_selections[62].mode, "random")
+
+    def test_bad_material_windows_and_conflicting_audio_exports_are_rejected(self):
+        for arguments in (("--material-window", "C4=3,1"),
+                          ("--material-window", "C#4=nan,2"),
+                          ("--random-material", "C20"),
+                          ("--audio-only", "one.wav", "--preview-audio", "two.wav")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                app.main(["--midi", str(self.midi_path), *arguments])
+            self.assertEqual(caught.exception.code, 2)
+
     def test_invalid_sizes_and_channels_exit_through_argparse(self):
         invalid = [
             ("--size", "2x2", "宽高"),

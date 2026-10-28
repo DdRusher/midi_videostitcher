@@ -157,8 +157,9 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def _check_assets(self):
         assets = self._make_assets()
-        with patch.object(gui, "validate_assets", return_value=assets), \
-                patch.object(gui, "find_ffmpeg", return_value="ffmpeg"):
+        info = {pitch: SimpleNamespace(path=path, duration=5.0, has_video=True, has_audio=True)
+                for pitch, path in assets.items()}
+        with patch.object(gui, "inspect_materials", return_value=info):
             self.app._check_assets()
             self._wait_for_idle()
         self.assertIn("检查通过", self.app.asset_summary.get())
@@ -413,6 +414,155 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("声音设备不可用", errors[0][1])
         self._assert_controls_restored()
+
+    def test_material_windows_are_applied_per_pitch_and_survive_range_changes(self):
+        self._load(self.midi_a)
+        self._check_assets()
+        self.assertEqual(len(self.app.material_table.get_children()), 3)
+        self.assertIn("力度：80–80 / 127", self.app.notes_text.get("1.0", "end"))
+        self.app.material_table.selection_set("60")
+        self.app._material_row_selected()
+        self.app.material_mode.set("随机选段")
+        self.app.material_start.set("1")
+        self.app.material_end.set("3")
+        self.app._apply_material_selection()
+        self.assertFalse([item for item in self.dialogs if item[0] == "error"])
+        settings = self.app._material_selections[60]
+        self.assertEqual((settings.start, settings.end, settings.mode), (1, 3, "random"))
+        options = self.app._render_options(self.directory/"out.mp4")
+        self.assertEqual(options.material_selections[60], settings)
+        self.assertTrue(options.respect_velocity)
+        self.app.track_list.selection_clear(0, "end")
+        self.app.track_list.selection_set(1)
+        self.app._selection_changed()
+        self.assertNotIn(60, self.app._render_options(self.directory/"bass.mp4").material_selections)
+        self.assertEqual(self.app._material_selections[60], settings)
+        self.app._select_all_tracks()
+        self.app.end_time.set(".9")
+        self.assertEqual(self.app._material_selections[60], settings)
+        self.app.video_dir.set(str(self.directory/"new-materials"))
+        self.assertEqual(self.app._material_selections, {})
+        self.assertEqual(self.app._material_info, {})
+
+    def test_bulk_material_selection_validates_all_before_saving(self):
+        self._load(self.midi_a)
+        self._check_assets()
+        self.app._material_info[64].duration = 1.5
+        self.app.material_start.set("1")
+        self.app.material_end.set("2")
+        self.app._apply_material_selection(all_pitches=True)
+        self.assertEqual(self.app._material_selections, {})
+        self.assertTrue(any(kind == "error" for kind, _ in self.dialogs))
+        self.dialogs.clear()
+        self.app.material_end.set("1.4")
+        self.app._apply_material_selection(all_pitches=True)
+        self.assertEqual(set(self.app._material_selections), {48,60,64})
+        self.assertFalse([item for item in self.dialogs if item[0] == "error"])
+
+    def test_imported_music_uses_labels_and_selected_global_audio_start_without_assets(self):
+        self._load(self.midi_a)
+        source = self.directory/"music.wav"
+        source.write_bytes(b"audio fixture")
+        self.app.video_dir.set("")
+        self.app.audio_path.set(str(source))
+        self.assertEqual(gui.VIDEO_MODES[self.app.video_mode.get()], "labels")
+        self.assertEqual(str(self.app.velocity_checkbox.cget("state")), "disabled")
+        self.app.start_time.set(".6")
+        self.app.end_time.set(".9")
+        options = self.app._render_options(self.directory/"labels.mp4")
+        self.assertEqual(options.audio_path, source)
+        self.assertAlmostEqual(options.audio_start, .6)
+        with patch.object(gui, "inspect_materials") as inspect:
+            self.app._check_assets()
+        inspect.assert_not_called()
+        self.assertIn("无需", self.app.asset_summary.get())
+        self.app.output_path.set(str(self.directory/"labels.mp4"))
+        with patch.object(gui, "render_midi", return_value=self.directory/"labels.mp4") as render:
+            self.app._start_export()
+            self._wait_for_idle()
+        self.assertEqual(render.call_args.args[1].video_mode, "labels")
+        self.assertFalse([item for item in self.dialogs if item[0] == "error"])
+
+    def test_imported_audio_preview_cache_tracks_file_changes(self):
+        self._load(self.midi_a)
+        source = self.directory/"music.wav"
+        source.write_bytes(b"audio fixture")
+        self.app.video_dir.set("")
+        self.app.audio_path.set(str(source))
+        self._main_thread = threading.get_ident()
+        with patch.object(gui, "validate_assets") as assets, \
+                patch.object(gui, "render_preview_audio", side_effect=self._write_preview) as render:
+            self.app._start_preview()
+            self._wait_for_idle()
+            self.app._stop_preview()
+            self.app._start_preview()
+            self._wait_for_idle()
+            self.assertEqual(render.call_count, 1)
+            self.app._stop_preview()
+            source.write_bytes(b"updated audio fixture")
+            self.app._start_preview()
+            self._wait_for_idle()
+            self.assertEqual(render.call_count, 2)
+        assets.assert_not_called()
+
+    def test_random_settings_and_velocity_invalidate_cached_preview(self):
+        self._load(self.midi_a)
+        self._check_assets()
+        self._main_thread = threading.get_ident()
+        with patch.object(gui, "render_preview_audio", side_effect=self._write_preview) as render:
+            self.app._start_preview()
+            self._wait_for_idle()
+            self.app._reroll_random()
+            self.assertEqual(self.app.random_seed.get(), "1")
+            self.assertIsNone(self.app._preview_path)
+            self.assertFalse(self.player.playing)
+            self.app._start_preview()
+            self._wait_for_idle()
+            self.assertEqual(render.call_count, 2)
+            self.app.respect_velocity.set(False)
+            self.assertIsNone(self.app._preview_path)
+            self.assertFalse(self.player.playing)
+            self.app.material_start.set(".25")
+            self.app.material_end.set("2")
+            options = self.app._render_options(self.directory/"out.mp4")
+            self.assertEqual(options.material_selections[self.app._material_edit_pitch].start, .25)
+
+    def test_audio_only_export_runs_worker_and_stops_preview(self):
+        self._load(self.midi_a)
+        output = self.directory/"only-audio.wav"
+        self.player.playing = True
+        self.app._preview_active = True
+        main_thread = threading.get_ident()
+        workers = []
+        def export(data, options, path, on_progress, cancel_event):
+            workers.append(threading.get_ident())
+            self.assertFalse(self.player.playing)
+            self.assertTrue(options.respect_velocity)
+            Path(path).write_bytes(b"completed audio")
+            return path
+        with patch.object(gui.filedialog, "asksaveasfilename", return_value=str(output)), \
+                patch.object(gui, "render_audio", side_effect=export):
+            self.app._start_audio_export()
+            self._wait_for_idle()
+        self.assertEqual(output.read_bytes(), b"completed audio")
+        self.assertEqual(self.app._last_output, output)
+        self.assertNotEqual(workers, [main_thread])
+        self.assertEqual(self.app.status.get(), "导出完成")
+        self._assert_controls_restored()
+
+    def test_small_window_keeps_actions_visible_without_horizontal_overflow(self):
+        self._load(self.midi_a)
+        self.app.deiconify()
+        self.app.geometry("860x720")
+        self.app.update()
+        right = self.app.winfo_rootx()+self.app.winfo_width()+2
+        for button in (self.app.preview_button, self.app.stop_preview_button, self.app.audio_export_button,
+                       self.app.export_button, self.app.cancel_button):
+            self.assertLessEqual(button.winfo_rooty()+button.winfo_height(),
+                                 self.app.winfo_rooty()+self.app.winfo_height()+2)
+            self.assertLessEqual(button.winfo_rootx()+button.winfo_width(), right)
+        self.assertLessEqual(self.app.material_table.winfo_rootx()+self.app.material_table.winfo_width(), right)
+        self.app.withdraw()
 
     def test_close_stops_preview_before_removing_temporary_files(self):
         self._load(self.midi_a)

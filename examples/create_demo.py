@@ -20,7 +20,7 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
     destination = destination.resolve()
     videos = destination / "videos"
     videos.mkdir(parents=True, exist_ok=True)
-    midi_path = destination / "demo-polyphonic.mid"
+    midi_path = destination / "demo-dynamics.mid"
     if not midi_path.exists():
         midi = mido.MidiFile(type=1, ticks_per_beat=480)
         conductor = mido.MidiTrack()
@@ -32,12 +32,12 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
         melody.append(mido.MetaMessage("track_name", name="Demo melody"))
         melody.append(mido.Message("program_change", program=0, channel=0))
         events = []
-        for start, end, pitch in (
-            (480, 1440, 60), (720, 1920, 64), (960, 1680, 67),
-            (1200, 1680, 60), (2160, 2400, 60),
-            (2400, 2640, 64), (2640, 2880, 67),
+        for start, end, pitch, velocity in (
+            (480, 1440, 60, 127), (720, 1920, 64, 96), (960, 1680, 67, 64),
+            (1200, 1680, 60, 40), (2160, 2400, 60, 100),
+            (2400, 2640, 64, 60), (2640, 2880, 67, 127),
         ):
-            events.append((start, mido.Message("note_on", note=pitch, velocity=90)))
+            events.append((start, mido.Message("note_on", note=pitch, velocity=velocity)))
             events.append((end, mido.Message("note_off", note=pitch, velocity=0)))
         previous = 0
         for tick, message in sorted(events, key=lambda item: (item[0], item[1].type == "note_on")):
@@ -46,9 +46,9 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
         melody.append(mido.MetaMessage("end_of_track", time=3360 - previous))
         harmony = mido.MidiTrack([
             mido.MetaMessage("track_name", name="Demo harmony"),
-            mido.Message("note_on", note=64, velocity=80, channel=1, time=480),
+            mido.Message("note_on", note=64, velocity=65, channel=1, time=480),
             mido.Message("note_off", note=64, velocity=0, channel=1, time=480),
-            mido.Message("note_on", note=67, velocity=80, channel=1, time=1440),
+            mido.Message("note_on", note=67, velocity=100, channel=1, time=1440),
             mido.Message("note_off", note=67, velocity=0, channel=1, time=480),
             mido.MetaMessage("end_of_track", time=480),
         ])
