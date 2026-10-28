@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import threading
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def _channel(value: str) -> int:
@@ -30,6 +30,15 @@ def _size(value: str) -> tuple[int, int]:
     return width, height
 
 
+def _time(value: str) -> float:
+    from selection import parse_time
+
+    try:
+        return parse_time(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MIDI 视频拼接：不带参数启动中文窗口，也可通过参数批量导出。"
@@ -41,16 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-dir", type=Path, default=Path("video"), help="音符视频素材目录（默认 video）")
     parser.add_argument("-o", "--output", type=Path, default=Path("output.mp4"), help="输出 MP4 路径")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--track", type=int, help="MIDI 轨道索引，从 0 开始；默认第一个含音符轨道")
+    selection.add_argument("--track", type=int, action="append", help="MIDI 轨道索引，从 0 开始，可重复指定；默认第一个含音符轨道")
     selection.add_argument("--all-tracks", action="store_true", help="把全部轨道放在同一时间线上")
-    parser.add_argument("--channel", type=_channel, help="MIDI 通道 1–16；默认所选轨道的全部通道")
+    parser.add_argument("--channel", type=_channel, action="append", help="MIDI 通道 1–16，可重复指定；默认全部通道")
+    parser.add_argument("--start", type=_time, default=0.0, help="选区开始，秒或 分:秒（默认 0）")
+    parser.add_argument("--end", type=_time, help="选区结束，秒或 分:秒；默认曲目结束")
     parser.add_argument("--list-tracks", action="store_true", help="显示轨道、通道和时长后退出")
     parser.add_argument("--check", action="store_true", help="检查素材映射后退出，不渲染")
     parser.add_argument("--size", type=_size, default=(1280, 720), help="输出宽x高（默认 1280x720）")
     parser.add_argument("--fps", type=int, default=30, help="输出帧率（默认 30）")
-    parser.add_argument("--chord-policy", choices=("highest", "lowest", "latest"), default="highest", help="重叠音符的单画面选择规则")
-    parser.add_argument("--audio", type=Path, help="使用外部配乐替代素材原声；MIDI 本身不含录音")
-    parser.add_argument("--silent", action="store_true", help="不保留素材原声")
+    parser.add_argument("--chord-policy", choices=("all", "highest", "lowest", "latest"), default="all", help="重叠音符处理，默认 all 同时分屏并叠加原声")
+    parser.add_argument("--preview-audio", type=Path, help="将选区原声混音保存为 WAV 试听文件，不渲染视频")
     parser.add_argument("--overwrite", action="store_true", help="允许替换已存在的输出文件")
     parser.add_argument("--ffmpeg", help="自定义 FFmpeg 可执行文件路径")
     return parser
@@ -94,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     cancel_event = threading.Event()
     try:
         from notes import load_midi, note_name
-        from renderer import RenderOptions, render_midi, validate_assets
+        from renderer import RenderOptions, render_midi, render_preview_audio, validate_assets
+        from selection import select_midi
 
         overview = load_midi(args.midi)
         if args.list_tracks:
@@ -105,12 +116,12 @@ def main(argv: list[str] | None = None) -> int:
             for warning in overview.warnings:
                 print(f"提示：{warning}")
             return 0
-        selected_track = args.track
-        if selected_track is None and not args.all_tracks:
-            selected_track = next((track.index for track in overview.tracks if track.note_count), None)
-        data = load_midi(args.midi, track=selected_track, channel=args.channel)
-        if not data.notes:
-            raise ValueError("所选轨道和通道没有可用音符")
+        selected_tracks = args.track
+        if selected_tracks is None and not args.all_tracks:
+            first = next((track.index for track in overview.tracks if track.note_count), None)
+            selected_tracks = [first] if first is not None else None
+        data = select_midi(overview, tracks=selected_tracks, channels=args.channel,
+                           start=args.start, end=args.end)
         for warning in data.warnings:
             print(f"提示：{warning}")
         if args.check:
@@ -126,17 +137,16 @@ def main(argv: list[str] | None = None) -> int:
             height=args.size[1],
             fps=args.fps,
             chord_policy=args.chord_policy,
-            audio_path=args.audio,
-            use_clip_audio=not args.silent,
+            use_clip_audio=True,
             overwrite=args.overwrite,
             ffmpeg_path=args.ffmpeg,
         )
-        result = render_midi(
-            data,
-            options,
-            on_progress=lambda value, message: print(f"{value:6.1%}  {message}", flush=True),
-            cancel_event=cancel_event,
-        )
+        progress = lambda value, message: print(f"{value:6.1%}  {message}", flush=True)
+        if args.preview_audio:
+            result = render_preview_audio(data, options, args.preview_audio,
+                                          on_progress=progress, cancel_event=cancel_event)
+        else:
+            result = render_midi(data, options, on_progress=progress, cancel_event=cancel_event)
         print(f"已保存：{result}")
         return 0
     except KeyboardInterrupt:

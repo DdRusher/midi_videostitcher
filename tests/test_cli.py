@@ -153,6 +153,96 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("没有可用音符", error)
         self.assertNotIn("Traceback", error)
 
+    def test_repeated_track_and_channel_options_combine_with_the_time_range(self):
+        self.add_materials("D4.mp4", "C3.mp4")
+        code, output, error = self.check(
+            "--track", "1", "--track", "2",
+            "--channel", "2", "--channel", "3",
+            "--start", "0.2", "--end", "0.4",
+        )
+        self.assertEqual(code, 0, error)
+        self.assertIn("D4 →", output)
+        self.assertIn("C3 →", output)
+        self.assertNotIn("C4 →", output)
+        self.assertIn("2 个音符", output)
+        self.assertIn("0.200 秒", output)
+
+    def test_time_range_checks_only_materials_used_in_the_selected_interval(self):
+        self.add_materials("D4.mp4")
+        code, output, error = self.check("--start", "00:00.300", "--end", "00:00.450")
+        self.assertEqual(code, 0, error)
+        self.assertIn("D4 →", output)
+        self.assertNotIn("C4 →", output)
+        self.assertIn("1 个音符", output)
+        self.assertIn("0.150 秒", output)
+
+    def test_duplicate_filters_do_not_duplicate_notes(self):
+        self.add_materials("C4.mp4", "D4.mp4")
+        code, output, error = self.check(
+            "--track", "1", "--track", "1",
+            "--channel", "1", "--channel", "2", "--channel", "2",
+        )
+        self.assertEqual(code, 0, error)
+        self.assertIn("2 个音符", output)
+
+    def test_invalid_or_note_free_ranges_fail_before_material_checks(self):
+        for arguments, explanation in (
+            (("--start", "0.4", "--end", "0.2"), "时间范围"),
+            (("--start", "0.2", "--end", "0.2"), "时间范围"),
+            (("--end", "1.1"), "时间范围"),
+            (("--start", "1"), "时间范围"),
+            (("--start", "0.6", "--end", "0.8"), "没有可用音符"),
+        ):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.check(*arguments)
+                self.assertEqual(code, 1)
+                self.assertIn(explanation, error)
+                self.assertNotIn("缺少", error)
+                self.assertNotIn("Traceback", error)
+                self.assertNotIn("检查完成", output)
+
+    def test_render_receives_clipped_timeline_and_continued_source_offsets(self):
+        output_path = self.directory / "成片.mp4"
+        with patch("renderer.render_midi", return_value=output_path) as render:
+            code, output, error = self.run_command(
+                "--midi", str(self.midi_path), "--video-dir", str(self.videos),
+                "--start", "0.2", "--end", "0.4", "--output", str(output_path),
+            )
+        self.assertEqual(code, 0, error)
+        render.assert_called_once()
+        data, options = render.call_args.args
+        self.assertAlmostEqual(data.duration, 0.2)
+        self.assertEqual([note.pitch for note in data.notes], [60, 62])
+        for note in data.notes:
+            self.assertAlmostEqual(note.start, 0.0)
+        self.assertAlmostEqual(data.notes[0].end, 0.05)
+        self.assertAlmostEqual(data.notes[1].end, 0.2)
+        self.assertAlmostEqual(data.notes[0].source_offset, 0.2)
+        self.assertAlmostEqual(data.notes[1].source_offset, 0.1)
+        self.assertEqual(options.chord_policy, "all")
+        self.assertTrue(options.use_clip_audio)
+        self.assertEqual(options.output_path, output_path)
+        self.assertIn(str(output_path), output)
+
+    def test_preview_audio_uses_the_selected_range_without_rendering_video(self):
+        preview_path = self.directory / "选区试听.wav"
+        with patch("renderer.render_preview_audio", return_value=preview_path, create=True) as preview, patch("renderer.render_midi") as video:
+            code, output, error = self.run_command(
+                "--midi", str(self.midi_path), "--video-dir", str(self.videos),
+                "--start", "0.1", "--end", "0.3", "--preview-audio", str(preview_path),
+            )
+        self.assertEqual(code, 0, error)
+        preview.assert_called_once()
+        video.assert_not_called()
+        data, options, received_path = preview.call_args.args
+        self.assertEqual(received_path, preview_path)
+        self.assertAlmostEqual(data.duration, 0.2)
+        self.assertEqual([note.pitch for note in data.notes], [60, 62])
+        self.assertAlmostEqual(data.notes[0].source_offset, 0.1)
+        self.assertAlmostEqual(data.notes[1].source_offset, 0.0)
+        self.assertEqual(options.chord_policy, "all")
+        self.assertIn(str(preview_path), output)
+
     def test_invalid_sizes_and_channels_exit_through_argparse(self):
         invalid = [
             ("--size", "2x2", "宽高"),
@@ -164,6 +254,9 @@ class CommandLineTests(unittest.TestCase):
             ("--channel", "17", "通道"),
             ("--channel", "-1", "通道"),
             ("--channel", "x", "通道"),
+            ("--start", "-1", "时间"),
+            ("--start", "NaN", "时间"),
+            ("--end", "01:60", "秒"),
         ]
         for flag, value, explanation in invalid:
             with self.subTest(flag=flag, value=value):

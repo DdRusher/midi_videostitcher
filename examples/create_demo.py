@@ -20,7 +20,7 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
     destination = destination.resolve()
     videos = destination / "videos"
     videos.mkdir(parents=True, exist_ok=True)
-    midi_path = destination / "demo.mid"
+    midi_path = destination / "demo-polyphonic.mid"
     if not midi_path.exists():
         midi = mido.MidiFile(type=1, ticks_per_beat=480)
         conductor = mido.MidiTrack()
@@ -33,8 +33,9 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
         melody.append(mido.Message("program_change", program=0, channel=0))
         events = []
         for start, end, pitch in (
-            (480, 960, 60), (960, 1440, 64), (1200, 1680, 67),
-            (1920, 2160, 60), (2160, 2640, 64), (2640, 2880, 67),
+            (480, 1440, 60), (720, 1920, 64), (960, 1680, 67),
+            (1200, 1680, 60), (2160, 2400, 60),
+            (2400, 2640, 64), (2640, 2880, 67),
         ):
             events.append((start, mido.Message("note_on", note=pitch, velocity=90)))
             events.append((end, mido.Message("note_off", note=pitch, velocity=0)))
@@ -43,7 +44,15 @@ def create_demo(output_dir: str | Path | None = None) -> tuple[Path, Path]:
             melody.append(message.copy(time=tick - previous))
             previous = tick
         melody.append(mido.MetaMessage("end_of_track", time=3360 - previous))
-        midi.tracks.extend((conductor, melody))
+        harmony = mido.MidiTrack([
+            mido.MetaMessage("track_name", name="Demo harmony"),
+            mido.Message("note_on", note=64, velocity=80, channel=1, time=480),
+            mido.Message("note_off", note=64, velocity=0, channel=1, time=480),
+            mido.Message("note_on", note=67, velocity=80, channel=1, time=1440),
+            mido.Message("note_off", note=67, velocity=0, channel=1, time=480),
+            mido.MetaMessage("end_of_track", time=480),
+        ])
+        midi.tracks.extend((conductor, melody, harmony))
         midi.save(midi_path)
     executable = find_ffmpeg()
     for name, color, frequency in (
@@ -82,7 +91,7 @@ def main() -> int:
         from renderer import RenderOptions, render_midi
 
         output = midi.parent / "demonstration.mp4"
-        render_midi(load_midi(midi, track=1),
+        render_midi(load_midi(midi),
                     RenderOptions(videos, output, width=640, height=360, overwrite=True),
                     on_progress=lambda progress, message: print(f"{progress:.0%} {message}", flush=True))
         print(f"成片: {output}")

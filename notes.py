@@ -30,6 +30,7 @@ class NoteEvent:
     velocity: int
     channel: int
     track: int
+    source_offset: float = 0.0
 
     @property
     def name(self) -> str:

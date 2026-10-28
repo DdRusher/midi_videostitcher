@@ -1,12 +1,12 @@
 """Render a MIDI timeline with local note videos, using FFmpeg only.
 
-MIDI times are quantized against one absolute frame clock.  Chords select one
-active note instead of extending the song by concatenating overlapping notes.
+MIDI times are quantized against one absolute frame clock.  Concurrent notes
+remain independent voices, with a dynamic video grid and one continuous mix.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import heapq
 import math
 import os
@@ -37,7 +37,7 @@ class RenderOptions:
     width: int = 1280
     height: int = 720
     fps: int = 30
-    chord_policy: str = "highest"
+    chord_policy: str = "all"
     audio_path: str | Path | None = None
     use_clip_audio: bool = True
     overwrite: bool = False
@@ -50,10 +50,59 @@ class TimelineSegment:
     end_frame: int
     pitch: int | None
     source_offset_frames: int = 0
+    source_offset: float = 0.0
 
     @property
     def frame_count(self) -> int:
         return self.end_frame - self.start_frame
+
+
+@dataclass(frozen=True)
+class TimelineVoice:
+    note_id: int
+    pitch: int
+    source_offset: float
+
+
+@dataclass(frozen=True)
+class PolyphonicSegment:
+    start_frame: int
+    end_frame: int
+    voices: tuple[TimelineVoice, ...]
+
+    @property
+    def frame_count(self) -> int:
+        return self.end_frame - self.start_frame
+
+
+@dataclass(frozen=True)
+class _QuantizedNote:
+    note_id: int
+    pitch: int
+    first: int
+    last: int
+    start: float
+    source_offset: float
+
+
+@dataclass(frozen=True)
+class _AudioInterval:
+    note_id: int
+    pitch: int
+    first: int
+    last: int
+    source_offset: float
+
+
+@dataclass(frozen=True)
+class _AudioLayer:
+    path: Path
+    first_sample: int
+    last_sample: int
+
+
+_AUDIO_RATE = 48000
+_AUDIO_BATCH = 24
 
 
 _EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
@@ -85,10 +134,10 @@ def find_ffmpeg(explicit: str | None = None) -> str:
                 candidate = str(path.resolve())
         if candidate is None:
             raise RenderError(f"找不到指定的 FFmpeg：{explicit}")
-        return candidate
+        return str(Path(candidate).resolve())
     candidate = shutil.which("ffmpeg")
     if candidate:
-        return candidate
+        return str(Path(candidate).resolve())
     try:
         import imageio_ffmpeg
 
@@ -143,21 +192,17 @@ def _note_frame_bounds(start: float, end: float, total: int, fps: int) -> tuple[
     return first, last
 
 
-def build_timeline(data: MidiData, fps: int = 30, chord_policy: str = "highest") -> tuple[TimelineSegment, ...]:
-    """Build frame-aligned segments with rests and a deterministic chord policy."""
+def _quantize_notes(data: MidiData, fps: int) -> tuple[int, dict[int, _QuantizedNote], int]:
     if isinstance(fps, bool) or not isinstance(fps, int) or not 1 <= fps <= 120:
         raise RenderError("帧率必须是 1 到 120 之间的整数。")
-    if chord_policy not in {"highest", "lowest", "latest"}:
-        raise RenderError("和弦处理方式必须是 highest、lowest 或 latest。")
     duration = float(data.duration)
     if not math.isfinite(duration) or duration <= 0:
         raise RenderError("MIDI 时长必须大于零。")
     if not data.notes:
         raise RenderError("所选轨道或通道没有可导出的音符。")
     total = max(1, math.ceil(duration * fps - 1e-9))
-    starts: dict[int, list[int]] = {}
-    ends: dict[int, list[int]] = {}
-    note_frames: dict[int, tuple[int, int, int, float]] = {}
+    notes: dict[int, _QuantizedNote] = {}
+    skipped = 0
     for index, note in enumerate(data.notes):
         start, end = float(note.start), float(note.end)
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start:
@@ -166,43 +211,77 @@ def build_timeline(data: MidiData, fps: int = 30, chord_policy: str = "highest")
         if not 0 <= pitch <= 127:
             raise RenderError(f"MIDI 音高超出范围：{pitch}")
         first, last = _note_frame_bounds(start, end, total, fps)
+        source_offset = float(getattr(note, "source_offset", 0.0))
+        if not math.isfinite(source_offset) or source_offset < 0:
+            raise RenderError("素材起始偏移必须是有限的非负秒数。")
         if last <= first:
+            skipped += 1
             continue
-        note_frames[index] = (first, last, pitch, start)
-        starts.setdefault(first, []).append(index)
-        ends.setdefault(last, []).append(index)
-    if not note_frames:
+        notes[index] = _QuantizedNote(index, pitch, first, last, start, source_offset)
+    if not notes:
         raise RenderError(f"全部 {len(data.notes)} 个音符在当前帧率下都不足一帧，无法生成可见音符画面；请提高帧率。")
+    return total, notes, skipped
+
+
+def _timeline(data: MidiData, fps: int, chord_policy: str):
+    if chord_policy not in {"all", "highest", "lowest", "latest"}:
+        raise RenderError("和弦处理方式必须是 all、highest、lowest 或 latest。")
+    total, notes, skipped = _quantize_notes(data, fps)
+    starts: dict[int, list[int]] = {}
+    ends: dict[int, list[int]] = {}
+    for note in notes.values():
+        starts.setdefault(note.first, []).append(note.note_id)
+        ends.setdefault(note.last, []).append(note.note_id)
     boundaries = sorted({0, total, *starts, *ends})
     active: set[int] = set()
     heap: list[tuple[float, float, int, int]] = []
-    segments: list[TimelineSegment] = []
-    previous_note: int | None = None
+    spans: list[tuple[int, int, tuple[int, ...]]] = []
     for first, last in zip(boundaries, boundaries[1:]):
         for index in ends.get(first, ()):
             active.discard(index)
         for index in starts.get(first, ()):
             active.add(index)
-            _, _, pitch, start = note_frames[index]
+            pitch, start = notes[index].pitch, notes[index].start
             if chord_policy == "highest":
                 key = (-pitch, -start, -index, index)
             elif chord_policy == "lowest":
                 key = (pitch, -start, -index, index)
-            else:
+            elif chord_policy == "latest":
                 key = (-start, -pitch, -index, index)
-            heapq.heappush(heap, key)
-        while heap and heap[0][3] not in active:
-            heapq.heappop(heap)
-        selected = heap[0][3] if heap else None
-        pitch = note_frames[selected][2] if selected is not None else None
-        offset = first - note_frames[selected][0] if selected is not None else 0
-        if segments and selected == previous_note and segments[-1].end_frame == first:
-            old = segments[-1]
-            segments[-1] = TimelineSegment(old.start_frame, last, old.pitch, old.source_offset_frames)
+            if chord_policy != "all":
+                heapq.heappush(heap, key)
+        if chord_policy == "all":
+            selected = tuple(sorted(active, key=lambda index: (notes[index].pitch, notes[index].start, index)))
         else:
-            segments.append(TimelineSegment(first, last, pitch, offset))
-        previous_note = selected
-    return tuple(segments)
+            while heap and heap[0][3] not in active:
+                heapq.heappop(heap)
+            selected = (heap[0][3],) if heap else ()
+        if spans and selected == spans[-1][2] and spans[-1][1] == first:
+            spans[-1] = (spans[-1][0], last, selected)
+        else:
+            spans.append((first, last, selected))
+    return spans, notes, skipped
+
+
+def build_timeline(data: MidiData, fps: int = 30, chord_policy: str = "highest") -> tuple[TimelineSegment, ...]:
+    """Backward-compatible single-voice timeline; default remains highest."""
+    if chord_policy == "all":
+        raise RenderError("多声部时间线请使用 build_polyphonic_timeline。")
+    spans, notes, _ = _timeline(data, fps, chord_policy)
+    return tuple(
+        TimelineSegment(first, last, notes[voices[0]].pitch, first - notes[voices[0]].first, notes[voices[0]].source_offset)
+        if voices else TimelineSegment(first, last, None)
+        for first, last, voices in spans
+    )
+
+
+def build_polyphonic_timeline(data: MidiData, fps: int = 30, chord_policy: str = "all") -> tuple[PolyphonicSegment, ...]:
+    """Keep every note's identity, including overlapping repetitions of a pitch."""
+    spans, notes, _ = _timeline(data, fps, chord_policy)
+    return tuple(PolyphonicSegment(first, last, tuple(
+        TimelineVoice(index, notes[index].pitch, notes[index].source_offset + (first - notes[index].first) / fps)
+        for index in voices
+    )) for first, last, voices in spans)
 
 
 def _run_process(
@@ -210,11 +289,12 @@ def _run_process(
     cancel_event: threading.Event | None,
     progress: Callable[[float], None] | None = None,
     expected_seconds: float = 0.0,
+    cwd: str | Path | None = None,
 ) -> tuple[int, bytes, bytes]:
     _check_cancel(cancel_event)
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags, cwd=cwd)
     except OSError as exc:
         raise RenderError(f"无法启动 FFmpeg：{exc}") from exc
     try:
@@ -241,8 +321,8 @@ def _run_process(
         raise
 
 
-def _encode(command: list[str], cancel_event: threading.Event | None, progress=None, expected_seconds=0.0) -> None:
-    code, _, stderr = _run_process(command, cancel_event, progress, expected_seconds)
+def _encode(command: list[str], cancel_event: threading.Event | None, progress=None, expected_seconds=0.0, *, cwd=None) -> None:
+    code, _, stderr = _run_process(command, cancel_event, progress, expected_seconds, cwd)
     if code:
         detail = stderr.decode("utf-8", errors="replace")[-5000:].strip()
         raise RenderError(f"FFmpeg 导出失败：\n{detail}")
@@ -256,38 +336,46 @@ def _probe(ffmpeg: str, path: Path, cancel_event: threading.Event | None) -> tup
     return has_video, has_audio
 
 
-def _validate_options(options: RenderOptions) -> Path:
+def _validate_options(options: RenderOptions, output_path: str | Path | None = None, extension: str = ".mp4") -> Path:
     for value, label in ((options.width, "宽度"), (options.height, "高度")):
         if isinstance(value, bool) or not isinstance(value, int) or not 16 <= value <= 7680 or value % 2:
             raise RenderError(f"视频{label}必须是 16 到 7680 之间的偶数。")
-    if not str(options.output_path).strip():
+    selected_output = options.output_path if output_path is None else output_path
+    if not str(selected_output).strip():
         raise RenderError("请选择输出文件。")
-    output = Path(options.output_path).expanduser().resolve()
-    if output.suffix.lower() != ".mp4":
-        raise RenderError("输出文件请使用 .mp4 扩展名。")
+    output = Path(selected_output).expanduser().resolve()
+    if output.suffix.lower() != extension:
+        raise RenderError(f"输出文件请使用 {extension} 扩展名。")
     if output.is_dir():
-        raise RenderError("输出路径指向文件夹，请选择一个 .mp4 文件名。")
+        raise RenderError(f"输出路径指向文件夹，请选择一个 {extension} 文件名。")
     return output
 
 
-def render_midi(
+@dataclass(frozen=True)
+class _RenderContext:
+    output: Path
+    segments: tuple[PolyphonicSegment, ...]
+    assets: dict[int, Path]
+    audio_by_pitch: dict[int, bool]
+    ffmpeg: str
+    soundtrack: Path | None
+
+
+def _prepare(
     data: MidiData,
     options: RenderOptions,
-    on_progress: Callable[[float, str], None] | None = None,
-    cancel_event: threading.Event | None = None,
-) -> Path:
-    """Render an MP4 and publish it only after every encoding step succeeds."""
+    on_progress,
+    cancel_event,
+    *,
+    output_path: str | Path | None = None,
+    extension: str = ".mp4",
+) -> _RenderContext:
     _check_cancel(cancel_event)
-    output = _validate_options(options)
-    segments = build_timeline(data, options.fps, options.chord_policy)
-    total_frames = segments[-1].end_frame
-    skipped_notes = 0
-    for note in data.notes:
-        first, last = _note_frame_bounds(float(note.start), float(note.end), total_frames, options.fps)
-        if last <= first:
-            skipped_notes += 1
-    if skipped_notes:
-        _notify(on_progress, 0.0, f"有 {skipped_notes} 个音符短于当前帧率可表示的时长，未显示；可提高帧率。")
+    output = _validate_options(options, output_path, extension)
+    segments = build_polyphonic_timeline(data, options.fps, options.chord_policy)
+    _, _, skipped = _quantize_notes(data, options.fps)
+    if skipped:
+        _notify(on_progress, 0.0, f"有 {skipped} 个音符短于当前帧率可表示的时长，未显示；可提高帧率。")
     assets = validate_assets(data, options.video_dir)
     soundtrack: Path | None = None
     if options.audio_path:
@@ -309,82 +397,267 @@ def render_midi(
         if not has_video:
             raise RenderError(f"素材没有可读取的视频画面：{source.name}")
         audio_by_pitch[pitch] = has_audio
+        if not has_audio and options.use_clip_audio and soundtrack is None:
+            _notify(on_progress, 0.0, f"素材 {source.name} 没有音轨，该音符将保持静音。")
     if soundtrack and not _probe(ffmpeg, soundtrack, cancel_event)[1]:
         raise RenderError(f"配乐文件中没有可读取的音轨：{soundtrack.name}")
     _check_cancel(cancel_event)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fps = options.fps
-    total_seconds = total_frames / fps
-    with tempfile.TemporaryDirectory(prefix=".midi-stitch-", dir=output.parent) as temporary:
-        work = Path(temporary)
-        concat_lines: list[str] = []
-        for number, segment in enumerate(segments):
-            _check_cancel(cancel_event)
-            seconds = segment.frame_count / fps
-            destination = work / f"segment-{number:06d}.mkv"
-            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
-            if segment.pitch is None:
-                label = "休止"
-                command += ["-f", "lavfi", "-i", f"color=c=black:s={options.width}x{options.height}:r={fps}"]
-                source_audio = False
-                offset = 0.0
+    return _RenderContext(output, segments, assets, audio_by_pitch, ffmpeg, soundtrack)
+
+
+def _sample_at_frame(frame: int, fps: int) -> int:
+    return (frame * _AUDIO_RATE * 2 + fps) // (2 * fps)
+
+
+def _command(ffmpeg: str) -> list[str]:
+    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+
+
+def _audio_intervals(segments: tuple[PolyphonicSegment, ...]) -> list[_AudioInterval]:
+    """Join a held note across changing grids without resetting its sound."""
+    intervals: list[_AudioInterval] = []
+    last_by_id: dict[int, int] = {}
+    for segment in segments:
+        for voice in segment.voices:
+            index = last_by_id.get(voice.note_id)
+            if index is not None and intervals[index].last == segment.start_frame:
+                intervals[index] = replace(intervals[index], last=segment.end_frame)
             else:
-                label = _pitch_name(segment.pitch)
-                command += ["-stream_loop", "-1", "-i", str(assets[segment.pitch])]
-                source_audio = options.use_clip_audio and soundtrack is None and audio_by_pitch[segment.pitch]
-                offset = segment.source_offset_frames / fps
-            if not source_audio:
-                command += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
-            video_filter = (
-                f"trim=start={offset:.9f},setpts=PTS-STARTPTS,fps={fps},"
-                f"scale={options.width}:{options.height}:force_original_aspect_ratio=decrease,"
-                f"pad={options.width}:{options.height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
-            )
-            audio_filter = (
-                f"atrim=start={offset if source_audio else 0:.9f},asetpts=PTS-STARTPTS,"
-                "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,apad"
-            )
-            command += [
-                "-map", "0:v:0", "-map", "0:a:0" if source_audio else "1:a:0",
-                "-vf", video_filter, "-af", audio_filter,
-                "-frames:v", str(segment.frame_count), "-t", f"{seconds:.9f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-bf", "0", "-threads", "2",
-                "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(destination),
-            ]
-            message = f"处理片段 {number + 1}/{len(segments)}：{label}"
-            _notify(on_progress, 0.9 * segment.start_frame / total_frames, message)
+                last_by_id[voice.note_id] = len(intervals)
+                intervals.append(_AudioInterval(voice.note_id, voice.pitch, segment.start_frame, segment.end_frame, voice.source_offset))
+    return sorted(intervals, key=lambda interval: (interval.first, interval.last, interval.note_id))
 
-            def segment_progress(ratio: float, current=segment, text=message) -> None:
-                _notify(on_progress, 0.9 * (current.start_frame + ratio * current.frame_count) / total_frames, text)
 
-            _encode(command, cancel_event, segment_progress, seconds)
-            concat_lines += [f"file '{destination.name}'", f"duration {seconds:.9f}"]
+def _filter_script(path: Path, filters: list[str]) -> str:
+    path.write_text(";\n".join(filters) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _write_silence(path: Path, sample_count: int, cancel_event, report) -> None:
+    import wave
+
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(_AUDIO_RATE)
+        written = 0
+        while written < sample_count:
+            _check_cancel(cancel_event)
+            chunk = min(16384, sample_count - written)
+            output.writeframesraw(b"\0" * (chunk * 4))
+            written += chunk
+        report(1.0, "素材没有音轨，成片保留静音。")
+
+
+def _mix_voice_batch(context, options, intervals, work, number, cancel_event, progress) -> _AudioLayer:
+    fps = options.fps
+    first = min(_sample_at_frame(interval.first, fps) for interval in intervals)
+    last = max(_sample_at_frame(interval.last, fps) for interval in intervals)
+    command = _command(context.ffmpeg)
+    filters = []
+    for index, interval in enumerate(intervals):
+        command += ["-stream_loop", "-1", "-i", str(context.assets[interval.pitch])]
+        offset = math.floor(interval.source_offset * _AUDIO_RATE + 0.5)
+        start = _sample_at_frame(interval.first, fps)
+        end = _sample_at_frame(interval.last, fps)
+        filters.append(
+            f"[{index}:a:0]aresample={_AUDIO_RATE}:async=1:first_pts=0,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=start_sample={offset}:end_sample={offset + end - start},"
+            f"asetpts=PTS-STARTPTS,adelay={start - first}S:all=1[voice{index}]"
+        )
+    labels = "".join(f"[voice{index}]" for index in range(len(intervals)))
+    filters.append(f"{labels}amix=inputs={len(intervals)}:duration=longest:dropout_transition=0:normalize=0,apad,atrim=end_sample={last - first}[mix]")
+    destination = work / f"audio-voices-{number:06d}.wav"
+    command += ["-filter_complex_script", _filter_script(work / f"audio-voices-{number:06d}.txt", filters), "-map", "[mix]", "-vn", "-c:a", "pcm_f32le", "-ar", str(_AUDIO_RATE), "-ac", "2", "-rf64", "auto", str(destination)]
+    _encode(command, cancel_event, progress, (last - first) / _AUDIO_RATE)
+    return _AudioLayer(destination, first, last)
+
+
+def _mix_layers(context, layers, destination, script, cancel_event, progress, *, total_samples=None, final=False) -> _AudioLayer:
+    first = 0 if total_samples is not None else min(layer.first_sample for layer in layers)
+    last = total_samples if total_samples is not None else max(layer.last_sample for layer in layers)
+    command = _command(context.ffmpeg)
+    filters = []
+    for index, layer in enumerate(layers):
+        command += ["-i", str(layer.path)]
+        filters.append(f"[{index}:a:0]asetpts=PTS-STARTPTS,adelay={layer.first_sample - first}S:all=1[layer{index}]")
+    labels = "".join(f"[layer{index}]" for index in range(len(layers)))
+    ending = "alimiter=limit=0.95:level=false:latency=true:attack=5:release=50," if final else ""
+    filters.append(
+        f"{labels}amix=inputs={len(layers)}:duration=longest:dropout_transition=0:normalize=0,"
+        f"apad,atrim=end_sample={last - first},{ending}apad,atrim=end_sample={last - first}[mix]"
+    )
+    command += ["-filter_complex_script", _filter_script(script, filters), "-map", "[mix]", "-vn", "-c:a", "pcm_s16le" if final else "pcm_f32le", "-ar", str(_AUDIO_RATE), "-ac", "2", "-rf64", "auto", str(destination)]
+    _encode(command, cancel_event, progress, (last - first) / _AUDIO_RATE)
+    return _AudioLayer(destination, first, last)
+
+
+def _render_audio(context, options, work, cancel_event, report, *, allow_silence: bool) -> Path:
+    """One continuous mix is shared by preview and video, with one limiter."""
+    total_samples = _sample_at_frame(context.segments[-1].end_frame, options.fps)
+    destination = work / "mixed-original-audio.wav"
+    if context.soundtrack is not None:
+        # Kept for old CLI/API callers; the desktop uses original clip audio.
+        filters = (
+            f"aresample={_AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,"
+            f"apad,atrim=end_sample={total_samples},alimiter=limit=0.95:level=false:latency=true,"
+            f"apad,atrim=end_sample={total_samples}"
+        )
+        command = _command(context.ffmpeg) + ["-i", str(context.soundtrack), "-map", "0:a:0", "-vn", "-af", filters, "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2", "-rf64", "auto", str(destination)]
+        _encode(command, cancel_event, lambda ratio: report(ratio, "正在处理配乐…"), total_samples / _AUDIO_RATE)
+        return destination
+    intervals = [interval for interval in _audio_intervals(context.segments) if options.use_clip_audio and context.audio_by_pitch[interval.pitch]]
+    if not intervals:
+        if not allow_silence:
+            if not options.use_clip_audio:
+                raise RenderError("素材原声已关闭，无法生成有声试听。")
+            raise RenderError("所选音符的视频素材没有可试听的音轨；成片仍可导出静音视频。")
+        _write_silence(destination, total_samples, cancel_event, report)
+        return destination
+    group_count = math.ceil(len(intervals) / _AUDIO_BATCH)
+    jobs = group_count + 1
+    remaining = group_count
+    while remaining > _AUDIO_BATCH:
+        remaining = math.ceil(remaining / _AUDIO_BATCH)
+        jobs += remaining
+    finished = 0
+
+    def job_progress(ratio):
+        report((finished + ratio) / jobs, f"正在混合素材原声 {finished + 1}/{jobs}…")
+
+    layers = []
+    for index in range(group_count):
+        _check_cancel(cancel_event)
+        group = intervals[index * _AUDIO_BATCH:(index + 1) * _AUDIO_BATCH]
+        layers.append(_mix_voice_batch(context, options, group, work, index, cancel_event, job_progress))
+        finished += 1
+    generation = 0
+    while len(layers) > _AUDIO_BATCH:
+        combined = []
+        for index in range(0, len(layers), _AUDIO_BATCH):
+            _check_cancel(cancel_event)
+            path = work / f"audio-layer-{generation}-{index}.wav"
+            combined.append(_mix_layers(context, layers[index:index + _AUDIO_BATCH], path, path.with_suffix(".txt"), cancel_event, job_progress))
+            finished += 1
+        layers = combined
+        generation += 1
+    _mix_layers(context, layers, destination, work / "audio-final.txt", cancel_event, job_progress, total_samples=total_samples, final=True)
+    return destination
+
+
+def _encode_grid_segment(context, options, segment, destination, script, cancel_event, progress) -> None:
+    command = _command(context.ffmpeg)
+    count = len(segment.voices)
+    seconds = segment.frame_count / options.fps
+    video_directory = Path(options.video_dir).expanduser().resolve()
+    if not count:
+        command += ["-f", "lavfi", "-i", f"color=c=black:s={options.width}x{options.height}:r={options.fps}", "-map", "0:v:0"]
+    else:
+        columns = math.ceil(math.sqrt(count))
+        rows = math.ceil(count / columns)
+        cell_width = options.width // columns // 2 * 2
+        cell_height = options.height // rows // 2 * 2
+        if cell_width < 2 or cell_height < 2:
+            raise RenderError(f"当前分辨率不足以同时显示 {count} 个音符，请提高输出分辨率。")
+        border = 2 if count > 1 and min(cell_width, cell_height) >= 16 else 0
+        picture_width, picture_height = cell_width - 2 * border, cell_height - 2 * border
+        # Each voice needs its own decoder. Splitting one decoder before trims
+        # with distant offsets can buffer the early voice while xstack waits.
+        for voice in segment.voices:
+            source = context.assets[voice.pitch]
+            try:
+                relative_source = os.path.relpath(source, video_directory)
+            except ValueError:  # Symlink target on another Windows drive.
+                relative_source = str(source)
+            command += ["-stream_loop", "-1", "-i", relative_source]
+        filters = []
+        for index, voice in enumerate(segment.voices):
+            filters.append(
+                f"[{index}:v:0]trim=start={voice.source_offset:.9f},setpts=PTS-STARTPTS,fps={options.fps},"
+                f"scale={picture_width}:{picture_height}:force_original_aspect_ratio=decrease,"
+                f"pad={cell_width}:{cell_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[tile{index}]"
+            )
+        if count == 1:
+            filters.append("[tile0]null[grid]")
+        else:
+            inputs = "".join(f"[tile{index}]" for index in range(count))
+            layout = "|".join(f"{index % columns * cell_width}_{index // columns * cell_height}" for index in range(count))
+            filters.append(f"{inputs}xstack=inputs={count}:layout={layout}:fill=black[grid]")
+        filters.append(f"[grid]pad={options.width}:{options.height}:(ow-iw)/2:(oh-ih)/2:color=black[vout]")
+        command += ["-filter_complex_script", _filter_script(script, filters), "-map", "[vout]"]
+    command += ["-an", "-frames:v", str(segment.frame_count), "-t", f"{seconds:.9f}", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "2", str(destination)]
+    _encode(command, cancel_event, progress, seconds, cwd=video_directory)
+
+
+def _publish(rendered: Path, output: Path, overwrite: bool, cancel_event) -> None:
+    _check_cancel(cancel_event)
+    if not rendered.is_file() or rendered.stat().st_size == 0:
+        raise RenderError("FFmpeg 未生成有效的输出文件。")
+    try:
+        if overwrite:
+            os.replace(rendered, output)
+        elif os.name == "nt":
+            os.rename(rendered, output)
+        else:
+            os.link(rendered, output)
+            rendered.unlink()
+    except FileExistsError as exc:
+        raise RenderError("导出期间出现了同名输出文件，已保留该文件。请换一个文件名后重试。") from exc
+
+
+def render_midi(
+    data: MidiData,
+    options: RenderOptions,
+    on_progress: Callable[[float, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Render every active voice in a grid with the same mix as audio preview."""
+    context = _prepare(data, options, on_progress, cancel_event)
+    context.output.parent.mkdir(parents=True, exist_ok=True)
+    total_frames = context.segments[-1].end_frame
+    total_seconds = total_frames / options.fps
+    with tempfile.TemporaryDirectory(prefix=".midi-stitch-", dir=context.output.parent) as temporary:
+        work = Path(temporary)
+        audio = _render_audio(context, options, work, cancel_event, lambda value, text: _notify(on_progress, 0.2 * value, text), allow_silence=True)
+        concat_lines = []
+        for number, segment in enumerate(context.segments):
+            _check_cancel(cancel_event)
+            destination = work / f"segment-{number:06d}.mkv"
+            script = work / f"video-grid-{number:06d}.txt"
+            label = "休止" if not segment.voices else f"{len(segment.voices)} 个同时音符"
+            message = f"处理画面 {number + 1}/{len(context.segments)}：{label}"
+            _notify(on_progress, 0.2 + 0.7 * segment.start_frame / total_frames, message)
+
+            def report(ratio, current=segment, text=message):
+                _notify(on_progress, 0.2 + 0.7 * (current.start_frame + ratio * current.frame_count) / total_frames, text)
+
+            _encode_grid_segment(context, options, segment, destination, script, cancel_event, report)
+            concat_lines += [f"file '{destination.name}'", f"duration {segment.frame_count / options.fps:.9f}"]
         manifest = work / "concat.txt"
         manifest.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
         rendered = work / "finished.mp4"
-        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats", "-f", "concat", "-safe", "0", "-i", str(manifest)]
-        if soundtrack:
-            command += ["-i", str(soundtrack)]
-        command += [
-            "-map", "0:v:0", "-map", "1:a:0" if soundtrack else "0:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-af", f"apad,atrim=duration={total_seconds:.9f},asetpts=PTS-STARTPTS",
-            "-t", f"{total_seconds:.9f}", "-movflags", "+faststart", str(rendered),
-        ]
+        command = _command(context.ffmpeg) + ["-f", "concat", "-safe", "0", "-i", str(manifest), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", str(_AUDIO_RATE), "-ac", "2", "-t", f"{total_seconds:.9f}", "-movflags", "+faststart", str(rendered)]
         _notify(on_progress, 0.9, "正在合成最终 MP4…")
         _encode(command, cancel_event, lambda ratio: _notify(on_progress, 0.9 + 0.09 * ratio, "正在合成最终 MP4…"), total_seconds)
-        _check_cancel(cancel_event)
-        if not rendered.is_file() or rendered.stat().st_size == 0:
-            raise RenderError("FFmpeg 未生成有效的输出文件。")
-        try:
-            if options.overwrite:
-                os.replace(rendered, output)
-            elif os.name == "nt":
-                os.rename(rendered, output)
-            else:
-                os.link(rendered, output)
-                rendered.unlink()
-        except FileExistsError as exc:
-            raise RenderError("导出期间出现了同名输出文件，已保留该文件。请换一个文件名后重试。") from exc
-    _notify(on_progress, 1.0, f"导出完成：{output.name}")
-    return output
+        _publish(rendered, context.output, options.overwrite, cancel_event)
+    _notify(on_progress, 1.0, f"导出完成：{context.output.name}")
+    return context.output
+
+
+def render_preview_audio(
+    data: MidiData,
+    options: RenderOptions,
+    output_path: str | Path,
+    on_progress: Callable[[float, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Write a PCM WAV using the identical original-audio selection and mix."""
+    context = _prepare(data, options, on_progress, cancel_event, output_path=output_path, extension=".wav")
+    if context.soundtrack is None and not any(options.use_clip_audio and context.audio_by_pitch[voice.pitch] for segment in context.segments for voice in segment.voices):
+        raise RenderError("所选音符的视频素材没有可试听的音轨；成片仍可导出静音视频。")
+    context.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".midi-stitch-preview-", dir=context.output.parent) as temporary:
+        audio = _render_audio(context, options, Path(temporary), cancel_event, lambda value, text: _notify(on_progress, 0.95 * value, text), allow_silence=False)
+        _publish(audio, context.output, options.overwrite, cancel_event)
+    _notify(on_progress, 1.0, f"试听已生成：{context.output.name}")
+    return context.output

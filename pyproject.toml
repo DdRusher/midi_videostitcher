@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midi-videostitcher"
-version = "0.2.0"
+version = "0.3.0"
 description = "用 MIDI 时间线编排音符视频素材的中文桌面工具"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,5 +18,5 @@ midi-videostitcher = "main:main"
 midi-videostitcher-gui = "gui:launch_gui"
 
 [tool.setuptools]
-py-modules = ["main", "gui", "notes", "renderer", "get_midi_info"]
+py-modules = ["main", "gui", "notes", "renderer", "selection", "preview_player", "get_midi_info"]
 packages = ["examples"]

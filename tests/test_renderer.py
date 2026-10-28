@@ -18,7 +18,9 @@ from renderer import (
     RenderCancelled,
     RenderError,
     RenderOptions,
+    build_polyphonic_timeline,
     build_timeline,
+    render_preview_audio,
     render_midi,
     validate_assets,
 )
@@ -86,6 +88,21 @@ class TimelineTests(unittest.TestCase):
         with self.assertRaises(RenderError):
             build_timeline(song(note(60, 0, 1)), 0)
 
+    def test_polyphonic_timeline_retains_independent_same_pitch_voices(self):
+        first = SimpleNamespace(pitch=60, start=0.0, end=0.8, source_offset=0.2)
+        second = SimpleNamespace(pitch=60, start=0.3, end=0.6, source_offset=0.0)
+        timeline = build_polyphonic_timeline(song(first, second), 10)
+        self.assertEqual([len(segment.voices) for segment in timeline], [1, 2, 1, 0])
+        overlap = timeline[1]
+        self.assertEqual([voice.note_id for voice in overlap.voices], [0, 1])
+        self.assertAlmostEqual(overlap.voices[0].source_offset, 0.5)
+        self.assertEqual(overlap.voices[1].source_offset, 0.0)
+        self.assertAlmostEqual(timeline[2].voices[0].source_offset, 0.8)
+
+    def test_legacy_timeline_retains_selected_media_offset(self):
+        data = song(SimpleNamespace(pitch=60, start=0, end=0.5, source_offset=1.25))
+        self.assertEqual(build_timeline(data)[0].source_offset, 1.25)
+
 
 class AssetAndSafetyTests(unittest.TestCase):
     def setUp(self):
@@ -111,6 +128,20 @@ class AssetAndSafetyTests(unittest.TestCase):
         (self.directory / "60.mp4").touch()
         with self.assertRaisesRegex(RenderError, "多个素材"):
             validate_assets(song(note(60, 0, 1)), self.directory)
+
+    def test_partial_missing_audio_track_is_reported_before_rendering(self):
+        from renderer import _prepare
+
+        (self.directory / "C4.mp4").touch()
+        (self.directory / "D4.mp4").touch()
+        progress = []
+        options = RenderOptions(self.directory, self.directory / "output.mp4")
+        with patch("renderer.find_ffmpeg", return_value="ffmpeg"), patch("renderer._probe", side_effect=[(True, True), (True, False)]):
+            context = _prepare(song(note(60, 0, 1), note(62, 0, 1)), options, lambda value, text: progress.append((value, text)), None)
+        self.assertTrue(context.audio_by_pitch[60])
+        self.assertFalse(context.audio_by_pitch[62])
+        self.assertIn((0.0, "素材 D4.mp4 没有音轨，该音符将保持静音。"), progress)
+        self.assertFalse((self.directory / "output.mp4").exists())
 
     def test_cancellation_happens_before_output_is_created(self):
         cancelled = threading.Event()
@@ -340,6 +371,235 @@ class RealExportTests(unittest.TestCase):
             )
         self.assertEqual(output.read_bytes(), b"previous export")
         self.assertFalse(list(self.directory.glob(".midi-stitch-*")))
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is not installed")
+class PolyphonicExportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.ffmpeg = shutil.which("ffmpeg")
+        self.flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    def run_ffmpeg(self, arguments):
+        return subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *arguments],
+            check=True, capture_output=True, creationflags=self.flags,
+        ).stdout
+
+    def make_asset(self, filename, colors=("red",), frequencies=(400,), duration=0.8, *, audio=True, impulse=None):
+        import array
+        import math
+        import wave
+
+        wave_path = self.directory / (Path(filename).stem + "-source.wav")
+        count = round(duration * 48000)
+        samples = array.array("h")
+        for index in range(count):
+            if impulse is not None:
+                value = 12000 if index == impulse else 0
+            else:
+                frequency = frequencies[min(len(frequencies) - 1, index * len(frequencies) // count)]
+                value = round(3000 * math.sin(2 * math.pi * frequency * index / 48000))
+            samples.extend((value, value))
+        with wave.open(str(wave_path), "wb") as output:
+            output.setnchannels(2)
+            output.setsampwidth(2)
+            output.setframerate(48000)
+            output.writeframes(samples.tobytes())
+        command = []
+        for color in colors:
+            command += ["-f", "lavfi", "-i", f"color={color}:s=64x64:r=20:d={duration / len(colors):.9f}"]
+        if audio:
+            command += ["-i", str(wave_path)]
+        if len(colors) > 1:
+            graph = "".join(f"[{index}:v:0]" for index in range(len(colors))) + f"concat=n={len(colors)}:v=1:a=0[v]"
+            command += ["-filter_complex_threads", "1", "-filter_complex", graph, "-map", "[v]"]
+        else:
+            command += ["-map", "0:v:0"]
+        if audio:
+            command += ["-map", f"{len(colors)}:a:0", "-c:a", "pcm_s16le"]
+        command += ["-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(self.directory / filename)]
+        self.run_ffmpeg(command)
+        return self.directory / filename
+
+    def options(self, output, **kwargs):
+        return RenderOptions(self.directory, self.directory / output, width=128, height=128, fps=20, **kwargs)
+
+    def pixel(self, path, time, x, y):
+        raw = self.run_ffmpeg(["-ss", str(time), "-i", str(path), "-frames:v", "1", "-vf", f"format=rgb24,crop=1:1:{x}:{y}", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        self.assertEqual(len(raw), 3)
+        return tuple(raw)
+
+    def audio_samples(self, path, time=0.0, duration=None):
+        import array
+
+        command = ["-ss", str(time), "-i", str(path)]
+        if duration is not None:
+            command += ["-t", str(duration)]
+        command += ["-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "pipe:1"]
+        return array.array("h", self.run_ffmpeg(command))
+
+    def amplitude(self, path, time, frequency, duration=0.05):
+        import math
+
+        samples = self.audio_samples(path, time, duration)
+        self.assertGreater(len(samples), 0)
+        omega = 2 * math.pi * frequency / 48000
+        real = sum(value * math.cos(omega * index) for index, value in enumerate(samples))
+        imaginary = sum(value * math.sin(omega * index) for index, value in enumerate(samples))
+        return 2 * math.hypot(real, imaginary) / len(samples)
+
+    def assert_red(self, pixel):
+        self.assertGreater(pixel[0], 180)
+        self.assertLess(pixel[1], 40)
+        self.assertLess(pixel[2], 40)
+
+    def assert_green(self, pixel):
+        self.assertGreater(pixel[1], 80)
+        self.assertLess(pixel[0], 40)
+        self.assertLess(pixel[2], 40)
+
+    def assert_blue(self, pixel):
+        self.assertGreater(pixel[2], 180)
+        self.assertLess(pixel[0], 40)
+        self.assertLess(pixel[1], 40)
+
+    def test_two_grid_voices_have_both_colors_and_unattenuated_original_tones(self):
+        self.make_asset("C4.mkv", ("red",), (400,))
+        self.make_asset("D4.mkv", ("green",), (600,))
+        data = song(note(60, 0, 0.8), note(62, 0.2, 0.6), duration=0.8)
+        options = self.options("two.mp4")
+        video = render_midi(data, options)
+        preview = render_preview_audio(data, options, self.directory / "two.wav")
+        self.assert_red(self.pixel(video, 0.3, 32, 64))
+        self.assert_green(self.pixel(video, 0.3, 96, 64))
+        # A visible divider distinguishes two identical-looking note clips too.
+        self.assertTrue(all(value < 20 for value in self.pixel(video, 0.3, 64, 64)))
+        before = self.amplitude(preview, 0.1, 400)
+        during = self.amplitude(preview, 0.3, 400)
+        after = self.amplitude(preview, 0.7, 400)
+        self.assertGreater(before, 1500)
+        self.assertAlmostEqual(during / before, 1.0, delta=0.02)
+        self.assertAlmostEqual(after / before, 1.0, delta=0.02)
+        self.assertGreater(self.amplitude(preview, 0.3, 600), 1500)
+        self.assertLess(self.amplitude(preview, 0.7, 600), 80)
+        for frequency in (400, 600):
+            self.assertAlmostEqual(self.amplitude(video, 0.3, frequency) / self.amplitude(preview, 0.3, frequency), 1.0, delta=0.15)
+        self.assertEqual(len(self.audio_samples(preview)), 38400)
+
+    def test_five_simultaneous_notes_are_all_in_the_grid(self):
+        for filename, color, frequency in (("C4.mkv", "red", 400), ("D4.mkv", "green", 600), ("E4.mkv", "blue", 800), ("F4.mkv", "yellow", 1000), ("G4.mkv", "magenta", 1200)):
+            self.make_asset(filename, (color,), (frequency,))
+        data = song(*(note(pitch, 0, 0.2) for pitch in (60, 62, 64, 65, 67)), duration=0.3)
+        output = render_midi(data, RenderOptions(self.directory, self.directory / "five.mp4", width=192, height=128, fps=20))
+        self.assert_red(self.pixel(output, 0.1, 32, 32))
+        self.assert_green(self.pixel(output, 0.1, 96, 32))
+        self.assert_blue(self.pixel(output, 0.1, 160, 32))
+        yellow = self.pixel(output, 0.1, 32, 96)
+        self.assertGreater(yellow[0], 180)
+        self.assertGreater(yellow[1], 180)
+        magenta = self.pixel(output, 0.1, 96, 96)
+        self.assertGreater(magenta[0], 180)
+        self.assertGreater(magenta[2], 180)
+        self.assertTrue(all(value < 20 for value in self.pixel(output, 0.1, 160, 96)))
+
+    def test_same_pitch_overlaps_keep_two_offsets_and_two_voices(self):
+        self.make_asset("C4.mkv", ("red", "green", "blue"), (400, 800, 1200), duration=0.6)
+        data = song(
+            SimpleNamespace(pitch=60, start=0.0, end=0.4, source_offset=0.0),
+            SimpleNamespace(pitch=60, start=0.1, end=0.4, source_offset=0.2),
+            duration=0.4,
+        )
+        options = self.options("same pitch.mp4")
+        output = render_midi(data, options)
+        preview = render_preview_audio(data, options, self.directory / "same pitch.wav")
+        self.assert_red(self.pixel(output, 0.15, 32, 64))
+        self.assert_green(self.pixel(output, 0.15, 96, 64))
+        self.assertGreater(self.amplitude(preview, 0.12, 400), 1500)
+        self.assertGreater(self.amplitude(preview, 0.12, 800), 1500)
+
+    def test_held_note_continues_when_other_voice_ends_and_grid_changes(self):
+        self.make_asset("C4.mkv", ("red", "green", "blue", "yellow"), (400, 600, 800, 1000))
+        self.make_asset("D4.mkv", ("magenta",), (1800,))
+        baseline = song(note(60, 0, 0.8), duration=0.8)
+        overlapped = song(note(60, 0, 0.8), note(62, 0.3, 0.5), duration=0.8)
+        options = self.options("continued.mp4")
+        video = render_midi(overlapped, options)
+        plain_audio = render_preview_audio(baseline, options, self.directory / "baseline.wav")
+        layered_audio = render_preview_audio(overlapped, options, self.directory / "overlapped.wav")
+        self.assert_blue(self.pixel(video, 0.55, 64, 64))
+        self.assertEqual(self.audio_samples(plain_audio, 0.55, 0.04), self.audio_samples(layered_audio, 0.55, 0.04))
+        self.assertGreater(self.amplitude(layered_audio, 0.55, 800, 0.04), 1500)
+
+    def test_time_selection_keeps_video_and_sound_source_offsets(self):
+        from notes import MidiData, NoteEvent, TrackInfo
+        from selection import select_midi
+
+        self.make_asset("C4.mkv", ("red", "green", "blue"), (400, 800, 1200), duration=0.6)
+        full = MidiData((NoteEvent(60, 0, 0.6, 100, 0, 0),), (TrackInfo(0, "note", (0,), 1),), 0.6, ())
+        selected = select_midi(full, start=0.25, end=0.55)
+        options = self.options("selected.mp4")
+        video = render_midi(selected, options)
+        preview = render_preview_audio(selected, options, self.directory / "selected.wav")
+        self.assert_green(self.pixel(video, 0.0, 64, 64))
+        self.assert_blue(self.pixel(video, 0.2, 64, 64))
+        self.assertGreater(self.amplitude(preview, 0.02, 800), 1500)
+        self.assertLess(self.amplitude(preview, 0.02, 400), 100)
+        self.assertGreater(self.amplitude(preview, 0.22, 1200), 1500)
+        self.assertEqual(len(self.audio_samples(preview)), 14400)
+
+    def test_preview_limiter_compensates_lookahead_delay(self):
+        self.make_asset("C4.mkv", duration=0.4, impulse=5000)
+        preview = render_preview_audio(song(note(60, 0, 0.4), duration=0.4), self.options("unused.mp4"), self.directory / "impulse.wav")
+        samples = self.audio_samples(preview)
+        self.assertEqual(max(range(len(samples)), key=lambda index: abs(samples[index])), 5000)
+        self.assertEqual(len(samples), 19200)
+
+    def test_preview_batches_many_notes_without_losing_late_notes(self):
+        self.make_asset("C4.mkv")
+        data = song(*(note(60, index / 20, (index + 1) / 20) for index in range(30)), duration=1.5)
+        progress = []
+        preview = render_preview_audio(data, self.options("unused.mp4"), self.directory / "many.wav", lambda value, text: progress.append(value))
+        self.assertGreater(self.amplitude(preview, 1.3, 400), 1500)
+        self.assertEqual(len(self.audio_samples(preview)), 72000)
+        self.assertTrue(all(a <= b + 1e-9 for a, b in zip(progress, progress[1:])))
+        self.assertEqual(progress[-1], 1.0)
+
+    def test_no_audio_track_is_reported_without_creating_preview(self):
+        self.make_asset("C4.mkv", audio=False)
+        destination = self.directory / "silent.wav"
+        with self.assertRaisesRegex(RenderError, "没有可试听的音轨"):
+            render_preview_audio(song(note(60, 0, 0.2)), self.options("unused.mp4"), destination)
+        self.assertFalse(destination.exists())
+
+    def test_cancelled_preview_preserves_existing_file(self):
+        self.make_asset("C4.mkv")
+        output = self.directory / "previous.wav"
+        output.write_bytes(b"old preview")
+        cancelled = threading.Event()
+
+        def report(value, text):
+            if value > 0:
+                cancelled.set()
+
+        with self.assertRaises(RenderCancelled):
+            render_preview_audio(song(note(60, 0, 0.8), duration=0.8), self.options("unused.mp4", overwrite=True), output, report, cancelled)
+        self.assertEqual(output.read_bytes(), b"old preview")
+        self.assertFalse(list(self.directory.glob(".midi-stitch-preview-*")))
+
+    def test_preview_cannot_replace_an_input_through_a_hard_link(self):
+        source = self.make_asset("C4.mkv")
+        output = self.directory / "input link.wav"
+        try:
+            os.link(source, output)
+        except OSError:
+            self.skipTest("Hard links are unavailable")
+        previous = source.read_bytes()
+        with self.assertRaisesRegex(RenderError, "不能覆盖"):
+            render_preview_audio(song(note(60, 0, 0.2)), self.options("unused.mp4", overwrite=True), output)
+        self.assertEqual(source.read_bytes(), previous)
 
 
 if __name__ == "__main__":
