@@ -20,106 +20,39 @@ GM_INSTRUMENTS = [
     "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", "Telephone Ring", "Helicopter", "Applause", "Gunshot"
 ]
 
-def analyze_midi(file_path):    
-    try:
-        mid = mido.MidiFile(file_path)
-    except Exception as e:
-        print("加载 MIDI 文件失败:", e)
-        return
-    
-    print("MIDI 文件名:", file_path)
-    # 尝试从第一个轨道的 meta 消息中获取歌曲名称（可能存在 track_name、sequence_name 或 song_title 消息）
-    song_name = None
-    for msg in mid.tracks[0]:
-        if msg.is_meta and msg.type in ["track_name", "sequence_name", "song_title"]:
-            song_name = msg.name
-            break
-    if song_name:
-        print("\n歌曲名称:", song_name)
-    else:
-        print("\n未在 MIDI 文件中找到歌曲名称。")
-    print("Ticks per beat:", mid.ticks_per_beat)
-    
-    # 尝试获取 BPM（tempo 通常以 set_tempo 消息给出，单位为微秒/拍）
-    tempo = None
-    for track in mid.tracks:
-        for msg in track:
-            if msg.type == 'set_tempo':
-                tempo = msg.tempo
-                break
-        if tempo is not None:
-            break
-    if tempo:
-        bpm = mido.tempo2bpm(tempo)
-    else:
-        bpm = "未知"
-    print("BPM:", bpm)
-    
-    print("轨道数量:", len(mid.tracks))
-    
-    # 全局统计：所有使用的乐器（program_change）以及每个通道使用的乐器
-    all_instruments = set()  # 存储全局 program number
-    channel_instruments = {}  # key: channel，value: set of program numbers
-    
-    # 遍历每个轨道，提取信息
-    for idx, track in enumerate(mid.tracks):
-        print("\n轨道 {}:".format(idx))
-        track_name = None
-        track_instruments = set()  # 本轨道使用的乐器 program numbers
-        track_channels = set()     # 本轨道使用的通道
-        
-        for msg in track:
-            if msg.is_meta:
-                # 获取轨道名称
-                if msg.type == "track_name":
-                    track_name = msg.name
-                # 如果有 instrument_name 消息，也可以在此处理
-            else:
-                # 如果消息中包含 channel 属性
-                if hasattr(msg, 'channel'):
-                    track_channels.add(msg.channel)
-                    # 记录 program_change 消息中的乐器信息
-                    if msg.type == "program_change":
-                        track_instruments.add(msg.program)
-                        # 更新按通道统计的字典
-                        if msg.channel not in channel_instruments:
-                            channel_instruments[msg.channel] = set()
-                        channel_instruments[msg.channel].add(msg.program)
-                        all_instruments.add(msg.program)
-        
-        if track_name is None:
-            track_name = "轨道{}".format(idx)
-        print("轨道名称:", track_name)
-        print("使用的通道:", sorted(list(track_channels)))
-        if track_instruments:
-            # 将 program number 转换为乐器名称
-            instrument_names_list = [GM_INSTRUMENTS[p] if p < len(GM_INSTRUMENTS) else f"Program {p}"
-                                       for p in sorted(list(track_instruments))]
-            print("使用的乐器 (program numbers):", sorted(list(track_instruments)))
-            print("使用的乐器 (名称):", instrument_names_list)
-        else:
-            print("该轨道未检测到乐器（可能仅包含打击乐或其他消息）")
-    
-    # 输出按通道统计的乐器信息
-    print("\n各通道的乐器统计:")
-    for ch in sorted(channel_instruments.keys()):
-        progs = sorted(list(channel_instruments[ch]))
-        instrument_names_list = [GM_INSTRUMENTS[p] if p < len(GM_INSTRUMENTS) else f"Program {p}"
-                                 for p in progs]
-        print("通道 {}: {} -> {}".format(ch, progs, instrument_names_list))
-    
-    # 全局乐器统计
-    if all_instruments:
-        progs = sorted(list(all_instruments))
-        instrument_names_list = [GM_INSTRUMENTS[p] if p < len(GM_INSTRUMENTS) else f"Program {p}"
-                                 for p in progs]
-        print("\nMIDI 文件中使用的所有乐器:")
-        print(progs, "->", instrument_names_list)
-    else:
-        print("MIDI 文件中未检测到乐器信息。")
-    
+def analyze_midi(file_path):
+    """Print timing and track information using the same parser as the desktop app."""
+    from notes import load_midi
+
+    data = load_midi(file_path)
+    midi = mido.MidiFile(file_path)
+    print("MIDI 文件:", file_path)
+    print("Ticks per beat:", midi.ticks_per_beat)
+    print(f"完整时长: {data.duration:.3f} 秒")
+    print("音符数量:", len(data.notes))
+    tempos = [message.tempo for track in midi.tracks for message in track
+              if message.type == "set_tempo"]
+    print("速度事件数量:", len(tempos), "（无事件时使用 120 BPM）")
+    for info, track in zip(data.tracks, midi.tracks):
+        programs = sorted({message.program for message in track
+                           if message.type == "program_change"})
+        channels = ", ".join(str(channel + 1) for channel in info.channels) or "无"
+        print(f"\n轨道 [{info.index}] {info.name}")
+        print(f"音符: {info.note_count} | 通道: {channels}")
+        if programs:
+            print("乐器:", ", ".join(GM_INSTRUMENTS[program] for program in programs))
+    for warning in data.warnings:
+        print("提示:", warning)
+    return data
 
 
 if __name__ == "__main__":
-    midi_file_path = "Hacking to the Gate.mid"
-    analyze_midi(midi_file_path)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="查看 MIDI 的轨道、音符和真实时长")
+    parser.add_argument("midi", help="MIDI 文件路径")
+    arguments = parser.parse_args()
+    try:
+        analyze_midi(arguments.midi)
+    except ValueError as error:
+        parser.exit(1, f"无法分析 MIDI：{error}\n")
