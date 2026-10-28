@@ -67,7 +67,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.midi_a = self._make_midi("a.mid", 60)
         self.midi_b = self._make_midi("b.mid", 72)
         self.dialogs = []
