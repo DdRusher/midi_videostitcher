@@ -104,6 +104,121 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(build_timeline(data)[0].source_offset, 1.25)
 
 
+class FilterScriptCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.command = [str(self.directory / "modern" / "ffmpeg.exe"), "-i", "input.mp4",
+                        "-filter_complex_script", str(self.directory / "filter_complex_script.txt"),
+                        "-map", "[vout]", "output.mp4"]
+        cache = patch.dict("renderer._FILTER_SCRIPT_OPTIONS", {}, clear=True)
+        cache.start()
+        self.addCleanup(cache.stop)
+        self.rejection = (1, b"", b"Unrecognized option 'filter_complex_script'.\nError splitting the argument list: Option not found\n")
+
+    def test_old_ffmpeg_keeps_legacy_option_without_retry(self):
+        from renderer import _encode
+
+        original = self.command.copy()
+        progress = []
+        with patch("renderer._run_process", return_value=(0, b"", b"")) as run:
+            _encode(self.command, None, progress.append)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], original)
+        self.assertEqual(self.command, original)
+        self.assertEqual(progress, [1.0])
+
+    def test_removed_option_retries_exact_token_and_preserves_context(self):
+        from renderer import _encode
+
+        cancellation = threading.Event()
+        original = self.command.copy()
+        with patch("renderer._run_process", side_effect=[self.rejection, (0, b"", b"")]) as run:
+            _encode(self.command, cancellation, expected_seconds=4.5, cwd=self.directory)
+        self.assertEqual(run.call_count, 2)
+        expected = original.copy()
+        expected[3] = "-/filter_complex"
+        self.assertEqual(run.call_args_list[0].args[0], original)
+        self.assertEqual(run.call_args_list[1].args[0], expected)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[1:], (cancellation, None, 4.5, self.directory))
+        self.assertEqual(self.command, original)
+
+    def test_modern_choice_is_cached_per_absolute_executable_path(self):
+        from renderer import _encode
+
+        second_binary = self.command.copy()
+        second_binary[0] = str(self.directory / "older" / "ffmpeg.exe")
+        with patch("renderer._run_process", side_effect=[self.rejection, (0, b"", b""),
+                                                        (0, b"", b""), (0, b"", b"")]) as run:
+            _encode(self.command, None)
+            _encode(self.command, None)
+            _encode(second_binary, None)
+        self.assertEqual(run.call_args_list[2].args[0][3], "-/filter_complex")
+        self.assertEqual(run.call_args_list[3].args[0][3], "-filter_complex_script")
+
+    def test_real_encoder_and_similar_option_errors_are_not_retried(self):
+        from renderer import _encode
+
+        for error in (b"No such filter: filter_complex_script",
+                      b"Unrecognized option 'filter_complex_script_extra'.",
+                      b"Error opening input file filter_complex_script."):
+            with self.subTest(error=error), patch("renderer._run_process", return_value=(1, b"", error)) as run:
+                with self.assertRaises(RenderError):
+                    _encode(self.command, None)
+                run.assert_called_once()
+
+    def test_rejection_without_legacy_argument_is_not_retried(self):
+        from renderer import _encode
+
+        with patch("renderer._run_process", return_value=self.rejection) as run:
+            with self.assertRaises(RenderError):
+                _encode([self.command[0], "-i", "input.mp4", "output.mp4"], None)
+        run.assert_called_once()
+
+    def test_failed_attempt_does_not_emit_completion_before_retry(self):
+        from renderer import _encode
+
+        progress = []
+
+        def execute(command, cancel, callback, seconds, cwd):
+            if "-filter_complex_script" in command:
+                callback(1.0)
+                return self.rejection
+            callback(0.5)
+            callback(1.0)
+            return 0, b"", b""
+
+        with patch("renderer._run_process", side_effect=execute):
+            _encode(self.command, None, progress.append)
+        self.assertEqual(progress, [0.5, 1.0])
+
+    def test_modern_encoder_failure_is_reported_without_another_retry(self):
+        from renderer import _encode
+
+        progress = []
+        with patch("renderer._run_process", side_effect=[self.rejection, (1, b"", b"modern encoder failed")]) as run:
+            with self.assertRaisesRegex(RenderError, "modern encoder failed"):
+                _encode(self.command, None, progress.append)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(progress, [])
+
+    def test_cancel_after_option_rejection_prevents_retry(self):
+        from renderer import _encode
+
+        cancellation = threading.Event()
+
+        def reject(*args):
+            cancellation.set()
+            return self.rejection
+
+        with patch("renderer._run_process", side_effect=reject) as run:
+            with self.assertRaises(RenderCancelled):
+                _encode(self.command, cancellation)
+        run.assert_called_once()
+
+
 class AssetAndSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

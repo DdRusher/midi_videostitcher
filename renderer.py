@@ -321,11 +321,36 @@ def _run_process(
         raise
 
 
+_FILTER_SCRIPT_OPTIONS: dict[str, str] = {}
+
+
 def _encode(command: list[str], cancel_event: threading.Event | None, progress=None, expected_seconds=0.0, *, cwd=None) -> None:
-    code, _, stderr = _run_process(command, cancel_event, progress, expected_seconds, cwd)
+    legacy_option = "-filter_complex_script"
+    modern_option = "-/filter_complex"
+    executable = str(Path(command[0]).expanduser().resolve())
+    selected_option = _FILTER_SCRIPT_OPTIONS.get(executable, legacy_option)
+    selected_command = [selected_option if item == legacy_option else item for item in command]
+
+    def report(fraction):
+        # A rejected command must not report completion before the retry starts.
+        if progress is not None and fraction < 1.0:
+            progress(fraction)
+
+    callback = report if progress is not None else None
+    code, _, stderr = _run_process(selected_command, cancel_event, callback, expected_seconds, cwd)
+    if (code and legacy_option in selected_command and
+            re.search(rb"(?m)^\s*Unrecognized option ['\"]filter_complex_script['\"]\.?\s*$", stderr)):
+        # FFmpeg 9 removed the old option; older releases still need it.
+        # Retry only this parser rejection, never an actual encoding failure.
+        _check_cancel(cancel_event)
+        _FILTER_SCRIPT_OPTIONS[executable] = modern_option
+        selected_command = [modern_option if item == legacy_option else item for item in selected_command]
+        code, _, stderr = _run_process(selected_command, cancel_event, callback, expected_seconds, cwd)
     if code:
         detail = stderr.decode("utf-8", errors="replace")[-5000:].strip()
         raise RenderError(f"FFmpeg 导出失败：\n{detail}")
+    if progress is not None:
+        progress(1.0)
 
 
 def _probe(ffmpeg: str, path: Path, cancel_event: threading.Event | None) -> tuple[bool, bool]:
