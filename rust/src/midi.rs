@@ -54,12 +54,23 @@ fn release_pedal(
 }
 
 pub fn load(path: &Path) -> Result<MidiData> {
+    load_with_sustain(path, false)
+}
+
+/// Load note intervals, optionally extending released keys with CC64 sustain.
+/// The default `load` follows NoteOff so each clip stops when its key is released.
+pub fn load_with_sustain(path: &Path, follow_sustain: bool) -> Result<MidiData> {
     let bytes =
         std::fs::read(path).with_context(|| format!("无法读取 MIDI 文件：{}", path.display()))?;
-    parse(&bytes).with_context(|| format!("无法解析 MIDI 文件：{}", path.display()))
+    parse_with_sustain(&bytes, follow_sustain)
+        .with_context(|| format!("无法解析 MIDI 文件：{}", path.display()))
 }
 
 pub fn parse(bytes: &[u8]) -> Result<MidiData> {
+    parse_with_sustain(bytes, false)
+}
+
+pub fn parse_with_sustain(bytes: &[u8], follow_sustain: bool) -> Result<MidiData> {
     let midi = Smf::parse(bytes).context("文件不是有效的 MIDI")?;
     if midi.header.format == Format::Sequential {
         bail!("暂不支持 Type 2 MIDI，请先转换为 Type 0 或 Type 1。")
@@ -149,7 +160,7 @@ pub fn parse(bytes: &[u8]) -> Result<MidiData> {
                     active.remove(&key);
                 }
                 if let Some(start) = start {
-                    if pedal[channel as usize] {
+                    if follow_sustain && pedal[channel as usize] {
                         sustained[channel as usize].push(start);
                     } else {
                         finish(start, seconds, &mut notes, &mut zero);
@@ -159,7 +170,7 @@ pub fn parse(bytes: &[u8]) -> Result<MidiData> {
                 }
             }
             Event::Controller(channel, controller, value) => match controller {
-                64 => {
+                64 if follow_sustain => {
                     if value < 64 {
                         release_pedal(channel, seconds, &mut sustained, &mut notes, &mut zero);
                     }
@@ -174,7 +185,7 @@ pub fn parse(bytes: &[u8]) -> Result<MidiData> {
                     for key in keys {
                         if let Some(starts) = active.remove(&key) {
                             for start in starts {
-                                if controller == 123 && pedal[channel as usize] {
+                                if controller == 123 && follow_sustain && pedal[channel as usize] {
                                     sustained[channel as usize].push(start);
                                 } else {
                                     finish(start, seconds, &mut notes, &mut zero);
@@ -412,7 +423,7 @@ mod tests {
     }
     #[test]
     fn pedal_in_another_track_and_sound_off() {
-        let data = parse(&file(vec![
+        let bytes = file(vec![
             vec![(0, cc(64, 127)), (720, cc(120, 0)), (240, end())],
             vec![
                 (0, on(60, 90)),
@@ -421,11 +432,16 @@ mod tests {
                 (480, off(64)),
                 (240, end()),
             ],
-        ]))
-        .unwrap();
+        ]);
+        let data = parse_with_sustain(&bytes, true).unwrap();
         assert_eq!(data.notes.len(), 2);
         assert!((data.notes[0].end - 0.75).abs() < 1e-9);
         assert!((data.notes[1].end - 0.75).abs() < 1e-9);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(direct.notes[0].end, 0.25);
+        assert_eq!(direct.notes[1].end, 0.75);
+        assert_eq!(direct.tracks, data.tracks);
+        assert_eq!(direct.duration, data.duration);
     }
     #[test]
     fn selection_retains_offset_rests_and_metadata() {
@@ -520,7 +536,7 @@ mod tests {
     }
     #[test]
     fn reset_controllers_releases_pedal_but_not_held_keys() {
-        let data = parse(&file(vec![vec![
+        let bytes = file(vec![vec![
             (0, cc(64, 127)),
             (0, on(60, 90)),
             (0, on(64, 90)),
@@ -528,23 +544,139 @@ mod tests {
             (240, cc(121, 0)),
             (240, off(64)),
             (240, end()),
-        ]]))
-        .unwrap();
+        ]]);
+        let data = parse_with_sustain(&bytes, true).unwrap();
         assert_eq!(data.notes[0].end, 0.5);
         assert_eq!(data.notes[1].end, 0.75);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(direct.notes[0].end, 0.25);
+        assert_eq!(direct.notes[1].end, 0.75);
     }
     #[test]
     fn all_notes_off_obeys_sustain() {
-        let data = parse(&file(vec![vec![
+        let bytes = file(vec![vec![
             (0, cc(64, 127)),
             (0, on(60, 90)),
             (240, cc(123, 0)),
             (480, cc(64, 0)),
             (240, end()),
-        ]]))
-        .unwrap();
+        ]]);
+        let data = parse_with_sustain(&bytes, true).unwrap();
         assert_eq!(data.notes.len(), 1);
         assert_eq!(data.notes[0].end, 0.75);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(direct.notes.len(), 1);
+        assert_eq!(direct.notes[0].end, 0.25);
+    }
+    #[test]
+    fn default_note_off_closes_only_that_voice_at_the_overlap_boundary() {
+        let bytes = file(vec![vec![
+            (0, cc(64, 127)),
+            (0, on(60, 90)),
+            (240, on(62, 80)),
+            (240, off(60)),
+            (0, on(64, 70)),
+            (240, on(62, 0)),
+            (240, off(64)),
+            (1440, cc(64, 0)),
+            (0, end()),
+        ]]);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(
+            direct
+                .notes
+                .iter()
+                .map(|n| (n.pitch, n.start, n.end))
+                .collect::<Vec<_>>(),
+            [(60, 0.0, 0.5), (62, 0.25, 0.75), (64, 0.5, 1.0)]
+        );
+        assert!(direct.warnings.is_empty());
+        let schedule = crate::timeline::build(&direct, 20, crate::model::ChordPolicy::All).unwrap();
+        let actual = schedule
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.first,
+                    s.last,
+                    s.voices.iter().map(|v| v.pitch).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (0, 5, vec![60]),
+                (5, 10, vec![60, 62]),
+                (10, 15, vec![62, 64]),
+                (15, 20, vec![64]),
+                (20, 50, vec![]),
+            ]
+        );
+        let sustained = parse_with_sustain(&bytes, true).unwrap();
+        assert!(sustained.notes.iter().all(|n| n.end == 2.5));
+    }
+    #[test]
+    fn ignored_unreleased_pedal_does_not_turn_closed_keys_into_dangling_notes() {
+        let bytes = file(vec![vec![
+            (0, cc(64, 127)),
+            (0, on(60, 90)),
+            (240, off(60)),
+            (1680, end()),
+        ]]);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(direct.notes[0].end, 0.25);
+        assert_eq!(direct.duration, 2.0);
+        assert!(direct.warnings.is_empty());
+        let sustained = parse_with_sustain(&bytes, true).unwrap();
+        assert_eq!(sustained.notes[0].end, 2.0);
+        assert_eq!(sustained.warnings.len(), 1);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note-off.mid");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(load(&path).unwrap().notes, direct.notes);
+        assert_eq!(
+            load_with_sustain(&path, true).unwrap().notes,
+            sustained.notes
+        );
+    }
+    #[test]
+    fn explicit_sustain_preserves_non_pedal_note_intervals() {
+        let bytes = file(vec![vec![
+            (0, on(60, 64)),
+            (120, on(60, 127)),
+            (120, on(60, 0)),
+            (120, off(60)),
+            (120, end()),
+        ]]);
+        let direct = parse(&bytes).unwrap();
+        let sustained = parse_with_sustain(&bytes, true).unwrap();
+        assert_eq!(direct.notes, sustained.notes);
+        assert_eq!(direct.tracks, sustained.tracks);
+        assert_eq!(direct.duration, sustained.duration);
+        assert_eq!(direct.warnings, sustained.warnings);
+    }
+    #[test]
+    fn all_sound_off_closes_held_keys_in_both_timing_modes() {
+        let bytes = file(vec![vec![
+            (0, cc(64, 127)),
+            (0, on(60, 90)),
+            (0, on(64, 90)),
+            (240, off(60)),
+            (240, cc(120, 0)),
+            (480, end()),
+        ]]);
+        let direct = parse(&bytes).unwrap();
+        assert_eq!(
+            direct.notes.iter().map(|n| n.end).collect::<Vec<_>>(),
+            [0.25, 0.5]
+        );
+        let sustained = parse_with_sustain(&bytes, true).unwrap();
+        assert_eq!(
+            sustained.notes.iter().map(|n| n.end).collect::<Vec<_>>(),
+            [0.5, 0.5]
+        );
+        assert!(direct.warnings.is_empty() && sustained.warnings.is_empty());
     }
     #[test]
     fn unmatched_dangling_and_zero_length_events_warn() {

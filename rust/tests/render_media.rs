@@ -1,6 +1,6 @@
 //! Real codec checks: the native compositor preserves voice identity and timing.
 use midi_videostitcher_rust::model::*;
-use midi_videostitcher_rust::{engine, media, process, timeline};
+use midi_videostitcher_rust::{engine, media, midi, process, timeline};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -122,6 +122,92 @@ fn native_grid_continues_material_across_layout_changes_and_loops() {
     assert!(red(pixel(&frame(&ffmpeg, &result, 1.2), 32, 32)));
     let rest = frame(&ffmpeg, &result, 1.5);
     assert!(rest.iter().all(|value| *value < 5));
+}
+
+#[test]
+fn released_notes_leave_the_grid_and_audio_even_while_pedal_is_down() {
+    use midly::{
+        Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
+    };
+    let Some(ffmpeg) = ffmpeg() else { return };
+    let directory = tempfile::tempdir().unwrap();
+    asset(&ffmpeg, &directory.path().join("C4.mkv"), "red", "red");
+    asset(&ffmpeg, &directory.path().join("E4.mkv"), "green", "green");
+    let message = |message| TrackEventKind::Midi {
+        channel: 0.into(),
+        message,
+    };
+    let on = |pitch: u8| {
+        message(MidiMessage::NoteOn {
+            key: pitch.into(),
+            vel: 100.into(),
+        })
+    };
+    let off = |pitch: u8| {
+        message(MidiMessage::NoteOff {
+            key: pitch.into(),
+            vel: 0.into(),
+        })
+    };
+    let pedal = |value: u8| {
+        message(MidiMessage::Controller {
+            controller: 64.into(),
+            value: value.into(),
+        })
+    };
+    let events = vec![
+        (0_u32, pedal(127)),
+        (0, on(60)),
+        (96, on(64)),
+        (96, off(60)),
+        (192, off(64)),
+        (384, pedal(0)),
+        (192, TrackEventKind::Meta(MetaMessage::EndOfTrack)),
+    ];
+    let file = Smf {
+        header: Header {
+            format: Format::SingleTrack,
+            timing: Timing::Metrical(480.into()),
+        },
+        tracks: vec![events
+            .into_iter()
+            .map(|(delta, kind)| TrackEvent {
+                delta: delta.into(),
+                kind,
+            })
+            .collect()],
+    };
+    let mut bytes = Vec::new();
+    file.write_std(&mut bytes).unwrap();
+    let data = midi::parse(&bytes).unwrap();
+    assert_eq!(
+        data.notes
+            .iter()
+            .map(|n| (n.start, n.end))
+            .collect::<Vec<_>>(),
+        vec![(0.0, 0.2), (0.1, 0.4)]
+    );
+    let mut opts = options(directory.path(), "note-off.mp4");
+    let output = engine::render(&data, &opts, &JobControl::default()).unwrap();
+    assert!(red(pixel(&frame(&ffmpeg, &output, 0.05), 32, 32)));
+    let overlap = frame(&ffmpeg, &output, 0.15);
+    assert!(red(pixel(&overlap, 16, 32)));
+    assert!(pixel(&overlap, 48, 32)[1] > 75);
+    let remaining = pixel(&frame(&ffmpeg, &output, 0.25), 32, 32);
+    assert!(remaining[1] > 75 && remaining[0] < 30 && remaining[2] < 30);
+    assert!(frame(&ffmpeg, &output, 0.45).iter().all(|v| *v < 5));
+    opts.output = directory.path().join("note-off.wav");
+    let audio = engine::render_audio(&data, &opts, &JobControl::default()).unwrap();
+    let samples: Vec<i16> = hound::WavReader::open(audio)
+        .unwrap()
+        .samples()
+        .map(Result::unwrap)
+        .collect();
+    assert!(samples[..38400].iter().any(|v| v.abs() > 100));
+    assert!(
+        samples[38400..].iter().all(|v| v.abs() <= 1),
+        "audio continued after the last NoteOff"
+    );
 }
 
 #[test]

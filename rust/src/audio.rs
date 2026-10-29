@@ -22,6 +22,8 @@ const CHANNELS: usize = 2;
 const BLOCK: u64 = 16_384;
 const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CACHED_SOURCE: usize = 64 * 1024 * 1024;
+// Remove sample discontinuities without extending a note beyond its NoteOff.
+const DECLICK_FRAMES: u64 = RATE / 200; // 5 ms at 48 kHz.
 
 #[derive(Default)]
 struct DecodeCache {
@@ -248,6 +250,40 @@ struct BlockTask {
     active: Vec<usize>,
 }
 
+fn note_fade_frames(length: u64) -> u64 {
+    DECLICK_FRAMES.min(length.saturating_sub(1) / 2)
+}
+
+fn loop_fade_frames(period: u64) -> u64 {
+    // Very short windows still retain an unchanged middle portion.
+    DECLICK_FRAMES.min(period.saturating_sub(1) / 4)
+}
+
+fn edge_gain(position: u64, length: u64, fade: u64) -> f32 {
+    if fade == 0 {
+        return 1.0;
+    }
+    let distance = position.min(length - 1 - position);
+    if distance >= fade {
+        return 1.0;
+    }
+    let x = distance as f32 / fade as f32;
+    x * x * (3.0 - 2.0 * x)
+}
+
+fn edge_chunk(position: u64, length: u64, fade: u64, limit: u64) -> u64 {
+    if fade == 0 {
+        return limit;
+    }
+    if position < fade {
+        limit.min(fade - position)
+    } else if position < length - 1 - fade {
+        limit.min(length - 1 - fade - position)
+    } else {
+        limit
+    }
+}
+
 fn mix_block(
     task: &BlockTask,
     intervals: &[Interval],
@@ -267,18 +303,53 @@ fn mix_block(
         let source = &sources[interval.source];
         let samples = source.values();
         let period = source.frames() as u64;
+        let note_length = interval.last - interval.first;
+        let note_fade = note_fade_frames(note_length);
+        let loop_fade = loop_fade_frames(period);
         let mut source_frame = (interval.offset + (target - interval.first)) % period;
         while target < last {
             control.check()?;
-            let count = (last - target).min(period - source_frame) as usize;
+            let age = target - interval.first;
+            let count = edge_chunk(
+                age,
+                note_length,
+                note_fade,
+                edge_chunk(
+                    source_frame,
+                    period,
+                    loop_fade,
+                    (last - target).min(period - source_frame),
+                ),
+            ) as usize;
             let output_start = (target - task.first) as usize * CHANNELS;
             let source_start = source_frame as usize * CHANNELS;
             let destination = &mut output[output_start..output_start + count * CHANNELS];
             let input = &samples[source_start..source_start + count * CHANNELS];
-            // Contiguous slices let LLVM vectorize the multiply-add. Different
-            // workers never write the same output block or reorder its notes.
-            for (destination, input) in destination.iter_mut().zip(input) {
-                *destination += *input * interval.gain;
+            let flat = edge_gain(age, note_length, note_fade) == 1.0
+                && edge_gain(age + count as u64 - 1, note_length, note_fade) == 1.0
+                && edge_gain(source_frame, period, loop_fade) == 1.0
+                && edge_gain(source_frame + count as u64 - 1, period, loop_fade) == 1.0;
+            if flat {
+                // The unchanged middle retains the vectorized multiply-add.
+                // Threads never share a block or reorder the active voices.
+                for (destination, input) in destination.iter_mut().zip(input) {
+                    *destination += *input * interval.gain;
+                }
+            } else {
+                for (frame, (destination, input)) in destination
+                    .chunks_exact_mut(CHANNELS)
+                    .zip(input.chunks_exact(CHANNELS))
+                    .enumerate()
+                {
+                    // Absolute voice/sample positions make fades independent
+                    // of worker blocks and video-grid layout changes.
+                    let gain = interval.gain
+                        * edge_gain(age + frame as u64, note_length, note_fade)
+                        * edge_gain(source_frame + frame as u64, period, loop_fade);
+                    for channel in 0..CHANNELS {
+                        destination[channel] += input[channel] * gain;
+                    }
+                }
             }
             target += count as u64;
             source_frame = (source_frame + count as u64) % period;
@@ -573,9 +644,21 @@ mod tests {
             let mut expected = 0.0;
             for interval in &intervals {
                 if frame >= interval.first && frame < interval.last {
-                    expected += source
-                        [((frame - interval.first + interval.offset) % 50) as usize * 2]
-                        * interval.gain;
+                    // Independent scalar definition: smoothstep over distance
+                    // from either endpoint, with an unchanged middle region.
+                    let envelope = |position: u64, length: u64, fade: u64| {
+                        if fade == 0 {
+                            return 1.0_f32;
+                        }
+                        let x = (position.min(length - 1 - position) as f32 / fade as f32).min(1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    let age = frame - interval.first;
+                    let position = (age + interval.offset) % 50;
+                    let gain = interval.gain
+                        * envelope(age, interval.last - interval.first, 240)
+                        * envelope(position, 50, 12);
+                    expected += source[position as usize * 2] * gain;
                 }
             }
             assert_eq!(actual[frame as usize * 2], expected, "frame {frame}");
@@ -609,8 +692,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first[..6], [0.0; 6]);
-        assert!((first[6] - 0.3 * 64.0 / 127.0).abs() < 1e-7);
-        assert!((second[0] - 0.4 * 64.0 / 127.0).abs() < 1e-7);
+        assert_eq!(
+            first[6], 0.0,
+            "a cropped nonzero source starts at zero gain"
+        );
+        assert!((first[8] - 0.4 * 64.0 / 127.0 * 0.04296875).abs() < 1e-7);
+        assert!((second[0] - 0.4 * 64.0 / 127.0 * 0.68359375).abs() < 1e-7);
+    }
+    #[test]
+    fn note_edges_are_smooth_and_end_in_silence_without_extending_the_voice() {
+        let sources = vec![samples(&vec![0.5; 96_000])];
+        let intervals = vec![interval(400, 20_000, 6000, 1.0)];
+        let mixed = mix_block(
+            &BlockTask {
+                first: 0,
+                frames: 21_000,
+                active: vec![0],
+            },
+            &intervals,
+            &sources,
+            &JobControl::default(),
+        )
+        .unwrap();
+        assert!(mixed[..400 * 2].iter().all(|sample| *sample == 0.0));
+        assert_eq!(mixed[400 * 2], 0.0);
+        assert_eq!(mixed[(20_000 - 1) * 2], 0.0);
+        assert!(mixed[20_000 * 2..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            mixed[1000 * 2],
+            0.5,
+            "preserve the original middle amplitude"
+        );
+        let maximum_jump = mixed
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            maximum_jump < 0.0032,
+            "5 ms fade should reduce a 0.5 hard step: {maximum_jump}"
+        );
+    }
+    #[test]
+    fn loop_seams_are_smoothed_without_moving_source_time_or_extending_notes() {
+        let period = 4800;
+        let source: Vec<f32> = (0..period)
+            .flat_map(|index| {
+                let value = -0.4 + 0.8 * index as f32 / (period - 1) as f32;
+                [value, value]
+            })
+            .collect();
+        let sources = vec![samples(&source)];
+        let intervals = vec![interval(130, 20_000, 1200, 1.0)];
+        let mixed = mix_block(
+            &BlockTask {
+                first: 0,
+                frames: 21_000,
+                active: vec![0],
+            },
+            &intervals,
+            &sources,
+            &JobControl::default(),
+        )
+        .unwrap();
+        for seam in [3730_usize, 8530, 13_330, 18_130] {
+            assert_eq!(mixed[(seam - 1) * 2], 0.0);
+            assert_eq!(mixed[seam * 2], 0.0);
+            let maximum_jump = (seam - 245..seam + 245)
+                .map(|frame| (mixed[(frame + 1) * 2] - mixed[frame * 2]).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                maximum_jump < 0.004,
+                "seam {seam} contains an abrupt step: {maximum_jump}"
+            );
+        }
+        assert_eq!(
+            mixed[2530 * 2],
+            source[3600 * 2],
+            "keep the original sample clock"
+        );
+        assert!(mixed[20_000 * 2..].iter().all(|sample| *sample == 0.0));
+    }
+    #[test]
+    fn float_mix_keeps_headroom_until_the_final_limiter() {
+        let sources = vec![samples(&vec![0.8; 192_000])];
+        let intervals = vec![
+            interval(0, 48_000, 24_000, 1.0),
+            interval(0, 48_000, 24_000, 1.0),
+        ];
+        let mixed = mix_block(
+            &BlockTask {
+                first: 1000,
+                frames: 8,
+                active: vec![0, 1],
+            },
+            &intervals,
+            &sources,
+            &JobControl::default(),
+        )
+        .unwrap();
+        assert!(
+            mixed.iter().all(|sample| (*sample - 1.6).abs() < 1e-7),
+            "overlapping samples must not clip before the final float limiter"
+        );
     }
     #[test]
     fn cancellation_stops_before_creating_mix() {

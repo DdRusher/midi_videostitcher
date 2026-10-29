@@ -395,6 +395,7 @@ enum JobOutput {
         path: PathBuf,
         stamp: FileStamp,
         data: MidiData,
+        sustained_data: MidiData,
     },
     Inspect(BTreeMap<u8, MediaInfo>),
     Preview {
@@ -421,6 +422,8 @@ pub struct StitcherApp {
     audio_path: String,
     options: RenderOptions,
     data: Option<MidiData>,
+    alternate_data: Option<MidiData>,
+    follow_sustain: bool,
     loaded_path: Option<PathBuf>,
     loaded_stamp: Option<FileStamp>,
     selected_tracks: BTreeSet<usize>,
@@ -471,6 +474,8 @@ impl StitcherApp {
             audio_path: String::new(),
             options: RenderOptions::default(),
             data: None,
+            alternate_data: None,
+            follow_sustain: false,
             loaded_path: None,
             loaded_stamp: None,
             selected_tracks: BTreeSet::new(),
@@ -532,6 +537,7 @@ impl StitcherApp {
         }
         self.midi_path = path;
         self.data = None;
+        self.alternate_data = None;
         self.loaded_path = None;
         self.loaded_stamp = None;
         self.selected_tracks.clear();
@@ -541,6 +547,24 @@ impl StitcherApp {
         self.selected_material = None;
         self.material_dirty = false;
         self.invalidate_preview();
+    }
+    fn set_follow_sustain(&mut self, enabled: bool) {
+        if self.follow_sustain == enabled {
+            return;
+        }
+        if self.data.is_some() && self.alternate_data.is_none() {
+            self.fail("请重新读取 MIDI 后切换延音踏板设置。");
+            return;
+        }
+        self.follow_sustain = enabled;
+        std::mem::swap(&mut self.data, &mut self.alternate_data);
+        self.invalidate_preview();
+        self.status = if enabled {
+            "已跟随延音踏板：松开琴键后，音符可能继续播放到踏板释放。"
+        } else {
+            "按音符结束关闭：视频和素材原声在 MIDI 音符结束时同步停止。"
+        }
+        .into();
     }
     fn set_video_dir(&mut self, path: String) {
         if self.video_dir == path {
@@ -740,12 +764,19 @@ impl StitcherApp {
         self.start_job(ctx, JobKind::Read, move |c| {
             c.check()?;
             let stamp = file_stamp(&path)?;
-            let data = midi::load(&path)?;
+            let data = midi::load_with_sustain(&path, false)?;
+            c.check()?;
+            let sustained_data = midi::load_with_sustain(&path, true)?;
             c.check()?;
             if stamp != file_stamp(&path)? {
                 bail!("读取期间 MIDI 文件发生变化，请重试。");
             }
-            Ok(JobOutput::Read { path, stamp, data })
+            Ok(JobOutput::Read {
+                path,
+                stamp,
+                data,
+                sustained_data,
+            })
         });
     }
     fn inspect(&mut self, ctx: &egui::Context) {
@@ -960,7 +991,17 @@ impl StitcherApp {
     fn finish(&mut self, result: std::result::Result<JobOutput, String>) {
         match result {
             Err(e) => self.fail(e),
-            Ok(JobOutput::Read { path, stamp, data }) => {
+            Ok(JobOutput::Read {
+                path,
+                stamp,
+                data,
+                sustained_data,
+            }) => {
+                let (data, alternate_data) = if self.follow_sustain {
+                    (sustained_data, data)
+                } else {
+                    (data, sustained_data)
+                };
                 self.selected_tracks = data
                     .tracks
                     .iter()
@@ -990,6 +1031,7 @@ impl StitcherApp {
                     self.log(format!("提示：{warning}"));
                 }
                 self.data = Some(data);
+                self.alternate_data = Some(alternate_data);
             }
             Ok(JobOutput::Inspect(infos)) => {
                 self.status = format!(
@@ -1108,6 +1150,21 @@ impl StitcherApp {
         let tracks = data.tracks.clone();
         let duration = data.duration;
         let mut changed = false;
+        let mut follow_sustain = self.follow_sustain;
+        if ui.checkbox(&mut follow_sustain, "跟随延音踏板").changed() {
+            self.set_follow_sustain(follow_sustain);
+            changed = true;
+        }
+        ui.label(
+            RichText::new(if self.follow_sustain {
+                "已启用：松开的音也会持续到踏板释放，可能增加同时播放的音符和分屏。"
+            } else {
+                "默认按音符时值播放：音符结束就撤掉视频并停止素材原声，只保留真实重叠。"
+            })
+            .size(13.)
+            .color(MUTED),
+        );
+        ui.add_space(5.);
         ui.horizontal(|ui| {
             if ui.button("全选轨道").clicked() {
                 self.selected_tracks = tracks
@@ -1807,6 +1864,14 @@ impl StitcherApp {
                 format!("{} × {}", self.options.width, self.options.height),
             ),
             ("帧率", format!("{} fps", self.options.fps)),
+            (
+                "音符结束",
+                if self.follow_sustain {
+                    "跟随延音踏板".into()
+                } else {
+                    "立即关闭视频与原声".into()
+                },
+            ),
         ] {
             ui.label(RichText::new(label).size(12.).color(MUTED));
             ui.label(value);
@@ -2173,7 +2238,64 @@ mod tests {
             duration: 4.,
             warnings: vec![],
         });
+        app.alternate_data = app.data.clone();
         app
+    }
+    #[test]
+    fn sustain_switch_preserves_selection_and_refreshes_preview_and_material_durations() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = loaded_app(directory.path());
+        assert!(!app.follow_sustain);
+        let sustained = app.alternate_data.as_mut().unwrap();
+        sustained.notes[0].end = 3.75;
+        sustained.notes[1].end = 3.9;
+        app.start = "1".into();
+        app.end = "3.5".into();
+        app.channel = Some(0);
+        app.options.materials.insert(
+            60,
+            MaterialChoice {
+                start: 0.5,
+                end: Some(4.),
+                random: true,
+            },
+        );
+        let music = directory.path().join("music.wav");
+        std::fs::write(&music, b"source metadata fixture").unwrap();
+        app.imported_audio = true;
+        app.audio_path = music.to_string_lossy().into_owned();
+        let options = app
+            .make_options(directory.path().join("preview.wav"), true)
+            .unwrap();
+        let pressed = app.selected_data().unwrap();
+        let first_key = preview_key(&pressed, &options).unwrap();
+        assert_eq!(app.needed_materials()[&60], 2.);
+        let old_preview = directory.path().join("cached.wav");
+        std::fs::write(&old_preview, b"old preview").unwrap();
+        app.preview_cache = Some((first_key, old_preview.clone()));
+
+        app.set_follow_sustain(true);
+        assert!(app.follow_sustain);
+        assert_eq!((&*app.start, &*app.end, app.channel), ("1", "3.5", Some(0)));
+        assert_eq!(app.selected_tracks, BTreeSet::from([0]));
+        assert_eq!(app.options.materials[&60].start, 0.5);
+        assert_eq!(app.options.materials[&60].end, Some(4.));
+        assert!(app.options.materials[&60].random);
+        assert!(app.preview_cache.is_none());
+        assert!(!old_preview.exists());
+        assert!(!app.player.active);
+        assert_eq!(app.needed_materials()[&60], 3.5);
+        let held = app.selected_data().unwrap();
+        assert_eq!(held.notes[0].end, 2.5);
+        assert_ne!(first_key, preview_key(&held, &options).unwrap());
+
+        app.set_follow_sustain(false);
+        assert_eq!(app.selected_data().unwrap(), pressed);
+        assert_eq!(
+            first_key,
+            preview_key(&app.selected_data().unwrap(), &options).unwrap()
+        );
+        assert_eq!((&*app.start, &*app.end, app.channel), ("1", "3.5", Some(0)));
     }
     #[test]
     fn player_starts_silent() {

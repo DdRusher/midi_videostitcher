@@ -40,6 +40,9 @@ struct Args {
     preview_audio: Option<PathBuf>,
     #[arg(long)]
     ignore_velocity: bool,
+    /// Follow sustain pedal; otherwise stop each material at the MIDI Note Off.
+    #[arg(long)]
+    sustain: bool,
     #[arg(long)]
     material_window: Vec<String>,
     #[arg(long, value_parser=parse_pitch)]
@@ -132,7 +135,7 @@ fn parse_pitch(value: &str) -> std::result::Result<u8, String> {
 
 fn run(args: Args) -> Result<()> {
     let path = args.midi.context("请指定 --midi，或直接打开桌面窗口。")?;
-    let overview = midi::load(&path)?;
+    let overview = midi::load_with_sustain(&path, args.sustain)?;
     if args.list_tracks {
         println!(
             "时长：{:.6} 秒；{} 个音符",
@@ -250,7 +253,7 @@ fn run(args: Args) -> Result<()> {
     println!("已保存：{}；耗时 {:.3} 秒", output.display(), elapsed);
     if let Some(path) = args.benchmark_json {
         let plan = timeline::build(&data, options.fps, options.chord)?;
-        let report = serde_json::json!({"engine":"rust","notes":data.notes.len(),"duration_seconds":data.duration,"segments":plan.segments.len(),"max_simultaneous_voices":plan.segments.iter().map(|s|s.voices.len()).max().unwrap_or(0),"width":options.width,"height":options.height,"fps":options.fps,"visuals":options.visuals,"wall_seconds":elapsed,"output_bytes":std::fs::metadata(output)?.len()});
+        let report = serde_json::json!({"engine":"rust","follow_sustain":args.sustain,"notes":data.notes.len(),"duration_seconds":data.duration,"segments":plan.segments.len(),"max_simultaneous_voices":plan.segments.iter().map(|s|s.voices.len()).max().unwrap_or(0),"width":options.width,"height":options.height,"fps":options.fps,"visuals":options.visuals,"wall_seconds":elapsed,"output_bytes":std::fs::metadata(output)?.len()});
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
     Ok(())
@@ -297,5 +300,18 @@ mod tests {
                 .is_err()
         );
         assert!(parse_size("3x720").is_err());
+    }
+    #[test]
+    fn sustain_is_explicitly_opt_in() {
+        assert!(
+            !Args::try_parse_from(["app", "--midi", "song.mid"])
+                .unwrap()
+                .sustain
+        );
+        assert!(
+            Args::try_parse_from(["app", "--midi", "song.mid", "--sustain"])
+                .unwrap()
+                .sustain
+        );
     }
 }
