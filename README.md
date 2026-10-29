@@ -1,4 +1,12 @@
-# MIDI 视频拼接器
+# MIDI 视频拼接器 · Rust 分支
+
+本分支提供 **Rust 原生中文桌面程序、MIDI 解析、并行音频混合与视频合成**，运行不需要 Python。Windows 应用包解压后双击 `start.bat` 或 `native/midi-videostitcher.exe`；源码构建、算法和测试说明见 [README-RUST.md](README-RUST.md)。
+
+Rust 源码位于 `rust/`，支持原声分屏、音名/频率/力度画面、固定与随机素材选段、选区试听、WAV 导出及导入完整音乐。FFmpeg 负责媒体编解码。
+
+下方保留 v0.4 Python 实现的参考文档，供回归与性能比较；其启动器改为 `start-python.bat`。
+
+## Python v0.4 参考文档
 
 把每个音符对应的素材，按 MIDI 的真实时间线编排成 MP4 或 WAV。**重叠音符同时分屏，原声按 MIDI 力度叠加。** v0.4 支持每个素材固定/随机选段、单独导出音频，以及“已有 MIDI＋导入音频”的快速音名/频率/力度画面。
 
@@ -6,7 +14,7 @@
 
 需要 **Python 3.10 或更新版本**。安装 Python 时请保留 Tcl/Tk，并勾选 **Add Python to PATH**。
 
-下载或克隆本仓库后，双击 **start.bat**。首次启动在项目目录建立独立环境并安装依赖，需要联网；以后直接打开窗口。
+下载或克隆本仓库后，双击 **start-python.bat**。首次启动在项目目录建立独立环境并安装依赖，需要联网；以后直接打开窗口。
 
 双击 **start_demo.bat** 可以先体验：程序会生成含变速、重叠音符、同音多次重叠和多轨道的演示 MIDI，以及三段带原声音效的彩色视频。点击“试听选区原声”或“开始导出”即可检验效果。演示文件存放在当前项目的 midi_videostitcher_demo 目录。
 

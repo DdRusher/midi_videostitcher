@@ -5,3 +5,5 @@
 *.yml text eol=lf
 *.txt text eol=lf
 *.bat text eol=crlf
+*.rs text eol=lf
+Cargo.lock text eol=lf

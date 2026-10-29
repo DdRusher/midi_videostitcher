@@ -12,3 +12,6 @@ examples/advanced_demo/
 midi_videostitcher_demo/
 output*.mp4
 *.log
+rust/target/
+rust/.cache/
+native/

@@ -1,0 +1,59 @@
+name: Rust native app
+
+on:
+  push:
+    branches: [codex/rust-engine]
+  pull_request:
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg pkg-config libx11-dev libxi-dev libxrandr-dev libxkbcommon-dev libgl1-mesa-dev
+      - name: Windows codecs
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Native tests
+        run: cargo test --locked --all-targets
+      - name: Build standalone apps
+        run: cargo build --locked --release --bins
+      - name: Windows applications
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: midi-videostitcher-rust-windows
+          path: |
+            rust/target/release/midi-videostitcher.exe
+            rust/target/release/midi-videostitcher-rust.exe
+      - name: Linux applications
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: midi-videostitcher-rust-linux
+          path: |
+            rust/target/release/midi-videostitcher
+            rust/target/release/midi-videostitcher-rust

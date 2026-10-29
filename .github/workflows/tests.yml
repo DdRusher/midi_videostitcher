@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main, codex/complete-desktop-app]
+    branches: [main, codex/complete-desktop-app, codex/rust-engine]
   pull_request:
 
 permissions:

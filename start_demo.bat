@@ -1,2 +1,2 @@
 @echo off
-call "%~dp0start.bat" --demo
+call "%~dp0start-python.bat" --demo
