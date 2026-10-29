@@ -14,8 +14,44 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-const BLUE: Color32 = Color32::from_rgb(79, 128, 244);
-const MUTED: Color32 = Color32::from_rgb(141, 154, 178);
+const BLUE: Color32 = Color32::from_rgb(87, 82, 212);
+const MUTED: Color32 = Color32::from_rgb(110, 120, 140);
+const INK: Color32 = Color32::from_rgb(30, 42, 62);
+const BACKGROUND: Color32 = Color32::from_rgb(246, 248, 252);
+const BORDER: Color32 = Color32::from_rgb(225, 230, 239);
+const TINT: Color32 = Color32::from_rgb(239, 237, 255);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workspace {
+    Input,
+    Materials,
+    Output,
+}
+
+fn card(ui: &mut egui::Ui, title: &str, description: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(egui::Stroke::new(1_f32, BORDER))
+        .corner_radius(12)
+        .inner_margin(18)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).size(18.).strong().color(INK));
+            if !description.is_empty() {
+                ui.label(RichText::new(description).size(13.).color(MUTED));
+            }
+            ui.add_space(12.);
+            body(ui);
+        });
+    ui.add_space(14.);
+}
+
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
+        .fill(BLUE)
+        .stroke(egui::Stroke::NONE)
+        .min_size(egui::vec2(122., 38.))
+}
 
 pub fn launch() -> eframe::Result<()> {
     launch_with_midi(None)
@@ -23,7 +59,7 @@ pub fn launch() -> eframe::Result<()> {
 pub fn launch_with_midi(initial: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120., 900.])
+            .with_inner_size([1180., 860.])
             .with_min_inner_size([880., 680.]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -72,13 +108,45 @@ fn install_fonts(ctx: &egui::Context) {
     }
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(9., 8.);
-    style.spacing.button_padding = egui::vec2(12., 7.);
+    style.spacing.button_padding = egui::vec2(13., 8.);
+    style.spacing.interact_size.y = 34.;
+    style.spacing.combo_width = 160.;
     style
         .text_styles
         .insert(egui::TextStyle::Body, egui::FontId::proportional(15.));
     style
         .text_styles
         .insert(egui::TextStyle::Button, egui::FontId::proportional(15.));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.));
+    let mut visuals = egui::Visuals::light();
+    visuals.override_text_color = Some(INK);
+    visuals.panel_fill = BACKGROUND;
+    visuals.window_fill = Color32::WHITE;
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.faint_bg_color = BACKGROUND;
+    visuals.selection.bg_fill = BLUE;
+    visuals.selection.stroke = egui::Stroke::new(1_f32, Color32::WHITE);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1_f32, BORDER);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1_f32, MUTED);
+    visuals.widgets.inactive.bg_fill = Color32::WHITE;
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(249, 250, 253);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1_f32, BORDER);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1_f32, INK);
+    visuals.widgets.inactive.corner_radius = 7.into();
+    visuals.widgets.hovered.bg_fill = TINT;
+    visuals.widgets.hovered.weak_bg_fill = TINT;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1_f32, BLUE.gamma_multiply(0.5));
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1_f32, BLUE);
+    visuals.widgets.hovered.corner_radius = 7.into();
+    visuals.widgets.active.bg_fill = TINT;
+    visuals.widgets.active.weak_bg_fill = TINT;
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1_f32, BLUE);
+    visuals.widgets.active.corner_radius = 7.into();
+    visuals.hyperlink_color = BLUE;
+    visuals.error_fg_color = Color32::from_rgb(187, 55, 71);
+    style.visuals = visuals;
     ctx.set_style(style);
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +406,7 @@ struct ActiveJob {
     thread: JoinHandle<()>,
 }
 pub struct StitcherApp {
+    workspace: Workspace,
     midi_path: String,
     video_dir: String,
     output_path: String,
@@ -376,13 +445,13 @@ pub struct StitcherApp {
 impl StitcherApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         install_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Self::new_state(initial)
     }
     fn new_state(initial: Option<PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
         let output = initial.as_ref().map(|p| p.with_extension("stitched.mp4"));
         Self {
+            workspace: Workspace::Input,
             midi_path: initial
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -951,65 +1020,50 @@ impl StitcherApp {
         }
     }
     fn file_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("1  选择 MIDI 和素材");
-        egui::Grid::new("paths")
-            .num_columns(3)
-            .spacing([10., 9.])
-            .show(ui, |ui| {
-                ui.label("MIDI 文件");
-                let mut path = self.midi_path.clone();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut path)
-                            .desired_width(ui.available_width() - 100.),
-                    )
-                    .changed()
+        ui.strong("MIDI 文件");
+        ui.horizontal(|ui| {
+            let mut path = self.midi_path.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut path)
+                        .desired_width((ui.available_width() - 112.).max(140.))
+                        .hint_text("选择 .mid 或 .midi 文件"),
+                )
+                .changed()
+            {
+                self.set_midi_path(path);
+            }
+            if ui.button("选择 MIDI").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("MIDI 文件", &["mid", "midi"])
+                    .pick_file()
                 {
-                    self.set_midi_path(path);
+                    self.set_midi_path(path.to_string_lossy().into_owned());
+                    self.read_midi(ctx);
                 }
-                if ui.button("选择 MIDI").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MIDI 文件", &["mid", "midi"])
-                        .pick_file()
-                    {
-                        self.set_midi_path(path.to_string_lossy().into_owned());
-                        self.read_midi(ctx);
-                    }
+            }
+        });
+        ui.add_space(6.);
+        ui.strong("素材文件夹");
+        ui.horizontal(|ui| {
+            let mut folder = self.video_dir.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut folder)
+                        .desired_width((ui.available_width() - 112.).max(140.))
+                        .hint_text("每个音高对应一个视频或音频素材"),
+                )
+                .changed()
+            {
+                self.set_video_dir(folder);
+            }
+            if ui.button("选择目录").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.set_video_dir(path.to_string_lossy().into_owned());
                 }
-                ui.end_row();
-                ui.label("素材目录");
-                let mut folder = self.video_dir.clone();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut folder)
-                            .desired_width(ui.available_width() - 100.),
-                    )
-                    .changed()
-                {
-                    self.set_video_dir(folder);
-                }
-                if ui.button("选择目录").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.set_video_dir(path.to_string_lossy().into_owned());
-                    }
-                }
-                ui.end_row();
-                ui.label("MP4 保存位置");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.output_path)
-                        .desired_width(ui.available_width() - 100.),
-                );
-                if ui.button("选择位置").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MP4 视频", &["mp4"])
-                        .set_file_name("output.mp4")
-                        .save_file()
-                    {
-                        self.output_path = path.to_string_lossy().into_owned();
-                    }
-                }
-                ui.end_row();
-            });
+            }
+        });
+        ui.add_space(6.);
         ui.horizontal_wrapped(|ui| {
             if ui.button("读取 MIDI").clicked() {
                 self.read_midi(ctx);
@@ -1020,13 +1074,28 @@ impl StitcherApp {
             {
                 self.inspect(ctx);
             }
-            ui.label(RichText::new("素材命名：C4.mp4、C#4.wav、60.mp4。").color(MUTED));
         });
+        ui.label(
+            RichText::new(
+                "素材按音高命名，例如 C4.mp4、C#4.wav 或 60.mp4。导入完整音乐时可不选素材。",
+            )
+            .size(13.)
+            .color(MUTED),
+        );
     }
     fn selection_controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("2  选择轨道与时间范围");
         let Some(data) = self.data.as_ref() else {
-            ui.label("读取 MIDI 后可选择多个轨道和片段。");
+            egui::Frame::new()
+                .fill(BACKGROUND)
+                .corner_radius(8)
+                .inner_margin(18)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("等待导入 MIDI").size(16.).strong());
+                    ui.label(
+                        RichText::new("读取后，这里会显示轨道、力度和可拖动的时间轴。")
+                            .color(MUTED),
+                    );
+                });
             return;
         };
         let tracks = data.tracks.clone();
@@ -1132,7 +1201,7 @@ impl StitcherApp {
                 ));
             }
             Err(e) => {
-                ui.colored_label(Color32::LIGHT_RED, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
     }
@@ -1149,7 +1218,7 @@ impl StitcherApp {
             Sense::click_and_drag(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 5., Color32::from_rgb(24, 32, 47));
+        painter.rect_filled(rect, 8., Color32::from_rgb(246, 246, 253));
         let left = rect.left() + 10.;
         let width = (rect.width() - 20.).max(1.);
         let mut start = midi::parse_time(self.start.trim())
@@ -1169,7 +1238,7 @@ impl StitcherApp {
                 egui::pos2(position(end), rect.bottom() - 18.),
             ),
             0.,
-            Color32::from_rgb(38, 58, 93),
+            Color32::from_rgb(230, 227, 255),
         );
         let mut density = vec![0.0f32; 250];
         for note in &data.notes {
@@ -1268,7 +1337,6 @@ impl StitcherApp {
         changed
     }
     fn material_controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("3  每个素材使用哪一段");
         if self.imported_audio {
             ui.label("当前使用整段音乐；切回素材原声后继续使用原来的选段设置。");
             return;
@@ -1410,7 +1478,7 @@ impl StitcherApp {
         }
     }
     fn sound_controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("4  声音与画面");
+        ui.strong("声音来源");
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             changed |= ui
@@ -1423,7 +1491,12 @@ impl StitcherApp {
                 changed = true;
                 self.options.visuals = VisualMode::Labels;
             }
+        });
+        ui.add_space(8.);
+        ui.strong("画面模式");
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("visual-mode")
+                .width(250.)
                 .selected_text(if self.options.visuals == VisualMode::Labels {
                     "音名 / 频率 / 力度（快速）"
                 } else {
@@ -1573,12 +1646,335 @@ impl StitcherApp {
             self.invalidate_preview();
         }
     }
+    fn output_controls(&mut self, ui: &mut egui::Ui) {
+        ui.strong("MP4 保存位置");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.output_path)
+                    .desired_width((ui.available_width() - 112.).max(140.))
+                    .hint_text("选择成片的保存位置"),
+            );
+            if ui.button("选择位置").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("MP4 视频", &["mp4"])
+                    .set_file_name("output.mp4")
+                    .save_file()
+                {
+                    self.output_path = path.to_string_lossy().into_owned();
+                }
+            }
+        });
+        ui.label(
+            RichText::new("单独导出 WAV 时会另选保存位置；已有文件会在覆盖前提示。")
+                .size(13.)
+                .color(MUTED),
+        );
+    }
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40., 40.), Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(rect, 10., BLUE);
+            for (i, height) in [12., 23., 18., 29., 12.].iter().enumerate() {
+                let x = rect.left() + 10. + i as f32 * 4.8;
+                painter.line_segment(
+                    [
+                        egui::pos2(x, rect.center().y - height / 2.),
+                        egui::pos2(x, rect.center().y + height / 2.),
+                    ],
+                    egui::Stroke::new(2.4_f32, Color32::WHITE),
+                );
+            }
+            ui.add_space(3.);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("MIDI 视频工作室")
+                        .size(22.)
+                        .strong()
+                        .color(INK),
+                );
+                ui.label(
+                    RichText::new("让每一个音符，都有自己的画面")
+                        .size(12.)
+                        .color(MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::Frame::new()
+                    .fill(TINT)
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 5))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("Rust · v{}", env!("CARGO_PKG_VERSION")))
+                                .size(12.)
+                                .color(BLUE)
+                                .strong(),
+                        );
+                    });
+            });
+        });
+        ui.add_space(14.);
+        let width = ((ui.available_width() - 18.) / 3.).max(150.);
+        ui.horizontal(|ui| {
+            for (page, label) in [
+                (Workspace::Input, "01   导入与选区"),
+                (Workspace::Materials, "02   素材片段"),
+                (Workspace::Output, "03   声音与输出"),
+            ] {
+                let active = self.workspace == page;
+                let button = egui::Button::new(RichText::new(label).strong().color(if active {
+                    BLUE
+                } else {
+                    MUTED
+                }))
+                .fill(if active { TINT } else { Color32::WHITE })
+                .stroke(egui::Stroke::new(
+                    1_f32,
+                    if active {
+                        BLUE.gamma_multiply(0.25)
+                    } else {
+                        BORDER
+                    },
+                ))
+                .min_size(egui::vec2(width, 39.));
+                if ui.add(button).clicked() {
+                    self.workspace = page;
+                }
+            }
+        });
+    }
+    fn project_summary(&self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("项目概览").size(16.).strong());
+        ui.add_space(12.);
+        let filename = Path::new(&self.midi_path)
+            .file_name()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "尚未选择 MIDI".into());
+        ui.label(RichText::new(filename).strong());
+        ui.add_space(6.);
+        if let Ok(data) = self.selected_data() {
+            egui::Frame::new()
+                .fill(BACKGROUND)
+                .corner_radius(9)
+                .inner_margin(12)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(time_text(data.duration))
+                            .size(25.)
+                            .strong()
+                            .color(BLUE),
+                    );
+                    ui.label(RichText::new("当前选区时长").small().color(MUTED));
+                    ui.add_space(10.);
+                    ui.label(format!("{} 个音符", data.notes.len()));
+                    ui.label(format!("{} 条所选轨道", self.selected_tracks.len()));
+                    let pitches: BTreeSet<_> = data.notes.iter().map(|n| n.pitch).collect();
+                    ui.label(format!("{} 种音高", pitches.len()));
+                });
+        } else {
+            ui.label(RichText::new("导入 MIDI 后，查看选区和导出信息。").color(MUTED));
+        }
+        ui.add_space(18.);
+        ui.separator();
+        ui.add_space(12.);
+        ui.label(RichText::new("导出设置").strong());
+        ui.add_space(6.);
+        for (label, value) in [
+            (
+                "画面",
+                if self.options.visuals == VisualMode::Clips {
+                    "原视频分屏".into()
+                } else {
+                    "音名 / 频率 / 力度".into()
+                },
+            ),
+            (
+                "声音",
+                if self.imported_audio {
+                    "导入的完整音乐".into()
+                } else {
+                    "素材原声混音".into()
+                },
+            ),
+            (
+                "尺寸",
+                format!("{} × {}", self.options.width, self.options.height),
+            ),
+            ("帧率", format!("{} fps", self.options.fps)),
+        ] {
+            ui.label(RichText::new(label).size(12.).color(MUTED));
+            ui.label(value);
+            ui.add_space(5.);
+        }
+        ui.add_space(16.);
+        egui::Frame::new()
+            .fill(TINT)
+            .corner_radius(9)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.label(RichText::new("小提示").color(BLUE).strong());
+                ui.label(
+                    RichText::new(match self.workspace {
+                        Workspace::Input => "拖动时间轴选择片段，左右边线可调整起止位置。",
+                        Workspace::Materials => {
+                            "固定选段或随机选段都可试听；相同随机编号会复用相同片段。"
+                        }
+                        Workspace::Output => "重叠音符会同时分屏，声音按照 MIDI 力度叠加。",
+                    })
+                    .size(13.)
+                    .color(MUTED),
+                );
+            });
+    }
+    fn workspace_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_enabled_ui(!self.busy() && !self.closing, |ui| match self.workspace {
+            Workspace::Input => {
+                card(
+                    ui,
+                    "导入你的音乐项目",
+                    "先选择 MIDI，再选择对应的声音或视频素材。",
+                    |ui| self.file_controls(ui, ctx),
+                );
+                card(
+                    ui,
+                    "轨道与时间选区",
+                    "只制作想听的声部与片段，支持多个轨道同时选择。",
+                    |ui| self.selection_controls(ui),
+                );
+            }
+            Workspace::Materials => {
+                card(
+                    ui,
+                    "为每个音高挑选片段",
+                    "点击素材行，设置固定范围或随机片段。",
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(self.data.is_some(), egui::Button::new("检查所选素材"))
+                                .clicked()
+                            {
+                                self.inspect(ctx);
+                            }
+                            ui.label(
+                                RichText::new(format!("已检查 {} 种素材", self.infos.len()))
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.add_space(12.);
+                        self.material_controls(ui);
+                    },
+                );
+            }
+            Workspace::Output => {
+                card(
+                    ui,
+                    "声音与画面",
+                    "保留素材原声，或导入完整音乐制作音名画面。",
+                    |ui| self.sound_controls(ui),
+                );
+                card(
+                    ui,
+                    "保存成片",
+                    "设置保存位置，试听满意后即可导出。",
+                    |ui| self.output_controls(ui),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            if self.workspace != Workspace::Input && ui.button("上一步").clicked() {
+                self.workspace = if self.workspace == Workspace::Output {
+                    Workspace::Materials
+                } else {
+                    Workspace::Input
+                };
+            }
+            if self.workspace != Workspace::Output {
+                let text = if self.workspace == Workspace::Input {
+                    "下一步：素材片段"
+                } else {
+                    "下一步：声音与输出"
+                };
+                if ui.add(primary_button(text)).clicked() {
+                    self.workspace = if self.workspace == Workspace::Input {
+                        Workspace::Materials
+                    } else {
+                        Workspace::Output
+                    };
+                }
+            }
+        });
+        ui.add_space(14.);
+        egui::CollapsingHeader::new(RichText::new("处理记录").size(13.).color(MUTED)).show(
+            ui,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("log")
+                    .max_height(180.)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.label(RichText::new(line).small());
+                        }
+                    });
+            },
+        );
+    }
+    fn show_workspace(&mut self, ctx: &egui::Context) -> (egui::Rect, egui::Rect) {
+        let mut footer = egui::Rect::NOTHING;
+        egui::TopBottomPanel::bottom("actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .stroke(egui::Stroke::new(1_f32, BORDER))
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ctx, |ui| {
+                self.footer(ui, ctx);
+                footer = ui.min_rect();
+            });
+        egui::TopBottomPanel::top("workspace-header")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(22, 16)),
+            )
+            .show(ctx, |ui| self.header(ui));
+        if ctx.content_rect().width() >= 1080. {
+            egui::SidePanel::right("project-summary")
+                .resizable(false)
+                .exact_width(244.)
+                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(18))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("summary-scroll")
+                        .show(ui, |ui| self.project_summary(ui));
+                });
+        }
+        let mut content = egui::Rect::NOTHING;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(18))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("workspace-content", self.workspace as u8))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.workspace_contents(ui, ctx);
+                        content = ui.min_rect();
+                    });
+            });
+        (footer, content)
+    }
     fn footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.add_space(5.);
         ui.horizontal_wrapped(|ui| {
             let ready = !self.busy() && !self.closing && self.data.is_some();
             if ui
-                .add_enabled(ready, egui::Button::new("试听选区").fill(BLUE))
+                .add_enabled(
+                    ready,
+                    egui::Button::new("试听选区").min_size(egui::vec2(100., 38.)),
+                )
                 .clicked()
             {
                 self.preview(ctx);
@@ -1591,13 +1987,13 @@ impl StitcherApp {
                 self.status = "试听已停止。".into();
             }
             if ui
-                .add_enabled(ready, egui::Button::new("仅导出音频 WAV"))
+                .add_enabled(ready, egui::Button::new("导出音频 WAV"))
                 .clicked()
             {
                 self.export(ctx, true);
             }
             if ui
-                .add_enabled(ready, egui::Button::new("导出视频 MP4").fill(BLUE))
+                .add_enabled(ready, primary_button("导出视频 MP4"))
                 .clicked()
             {
                 self.export(ctx, false);
@@ -1640,17 +2036,68 @@ impl StitcherApp {
                 }
             }
         });
-        ui.add(egui::ProgressBar::new(self.fraction as f32).show_percentage());
-        ui.label(&self.status);
-        if let Some(error) = self.error.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(Color32::LIGHT_RED, &error);
-                if ui.small_button("关闭提示").clicked() {
-                    self.error = None;
-                }
-            });
+        ui.add_space(3.);
+        if self.busy() {
+            ui.add(
+                egui::ProgressBar::new(self.fraction as f32)
+                    .fill(BLUE)
+                    .desired_height(5.),
+            );
         }
-        ui.add_space(4.);
+        ui.horizontal(|ui| {
+            let color = if self.error.is_some() {
+                ui.visuals().error_fg_color
+            } else if self.busy() {
+                BLUE
+            } else {
+                Color32::from_rgb(60, 146, 118)
+            };
+            ui.label(RichText::new("●").color(color).size(10.));
+            if self.busy() {
+                ui.label(
+                    RichText::new(format!("{:.0}%", self.fraction * 100.))
+                        .small()
+                        .color(BLUE),
+                );
+            }
+            ui.add(egui::Label::new(RichText::new(&self.status).size(12.).color(MUTED)).truncate())
+                .on_hover_text(&self.status);
+        });
+        if let Some(error) = self.error.clone() {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(255, 241, 242))
+                .corner_radius(8)
+                .inner_margin(10)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("操作未完成")
+                                .strong()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        if ui.small_button("复制错误详情").clicked() {
+                            ctx.copy_text(error.clone());
+                        }
+                        if ui.small_button("关闭提示").clicked() {
+                            self.error = None;
+                        }
+                    });
+                    egui::CollapsingHeader::new("查看错误详情")
+                        .id_salt("error-details-header")
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("error-details")
+                                .max_height(80.)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(error)
+                                            .size(12.)
+                                            .color(ui.visuals().error_fg_color),
+                                    );
+                                });
+                        });
+                });
+        }
     }
 }
 impl eframe::App for StitcherApp {
@@ -1666,46 +2113,7 @@ impl eframe::App for StitcherApp {
             self.cancel();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| self.footer(ui, ctx));
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("MIDI 视频拼接器");
-                ui.label(RichText::new("Rust 原生版").color(BLUE));
-            });
-            ui.label(
-                RichText::new("重叠音符同时分屏 · 力度混音 · 素材选段 · 音名画面快速导出")
-                    .color(MUTED),
-            );
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("main-content")
-                .show(ui, |ui| {
-                    ui.add_enabled_ui(!self.busy() && !self.closing, |ui| {
-                        self.file_controls(ui, ctx);
-                        ui.add_space(10.);
-                        ui.separator();
-                        self.selection_controls(ui);
-                        ui.add_space(10.);
-                        ui.separator();
-                        self.material_controls(ui);
-                        ui.add_space(10.);
-                        ui.separator();
-                        self.sound_controls(ui);
-                    });
-                    ui.add_space(8.);
-                    egui::CollapsingHeader::new("处理记录").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("log")
-                            .max_height(180.)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for line in &self.logs {
-                                    ui.label(RichText::new(line).small());
-                                }
-                            });
-                    });
-                });
-        });
+        self.show_workspace(ctx);
         if self.busy() || self.player.active {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -2006,47 +2414,37 @@ mod tests {
             },
         );
         app.choose_material(60).unwrap();
-        for (width, height) in [(880.0_f32, 680.0_f32), (1120.0_f32, 900.0_f32)] {
-            let mut footer = egui::Rect::NOTHING;
-            let mut content = egui::Rect::NOTHING;
-            for _ in 0..3 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, height),
-                    )),
-                    ..Default::default()
-                };
-                let _ = context.run(input, |ctx| {
-                    egui::TopBottomPanel::bottom("test-footer").show(ctx, |ui| {
-                        app.footer(ui, ctx);
-                        footer = ui.min_rect();
+        app.error = Some("missing file / long diagnostic line\n".repeat(200));
+        for (width, height) in [(880.0_f32, 680.0_f32), (1180.0_f32, 860.0_f32)] {
+            for page in [Workspace::Input, Workspace::Materials, Workspace::Output] {
+                app.workspace = page;
+                let mut footer = egui::Rect::NOTHING;
+                let mut content = egui::Rect::NOTHING;
+                for _ in 0..3 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    };
+                    let _ = context.run(input, |ctx| {
+                        (footer, content) = app.show_workspace(ctx);
                     });
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("test-content")
-                            .show(ui, |ui| {
-                                app.file_controls(ui, ctx);
-                                app.selection_controls(ui);
-                                app.material_controls(ui);
-                                app.sound_controls(ui);
-                                content = ui.min_rect();
-                            });
-                    });
-                });
+                }
+                assert!(
+                    footer.bottom() <= height + 1.0 && footer.top() >= height - 260.,
+                    "footer {footer:?} in {width}x{height} {page:?}"
+                );
+                assert!(
+                    footer.right() <= width + 1.0,
+                    "footer {footer:?} in {width}x{height} {page:?}"
+                );
+                assert!(
+                    content.right() <= width + 1.0,
+                    "content {content:?} in {width}x{height} {page:?}"
+                );
             }
-            assert!(
-                footer.bottom() <= height + 1.0,
-                "footer {footer:?} in {width}x{height}"
-            );
-            assert!(
-                footer.right() <= width + 1.0,
-                "footer {footer:?} in {width}x{height}"
-            );
-            assert!(
-                content.right() <= width + 1.0,
-                "content {content:?} in {width}x{height}"
-            );
         }
         assert!(!app.busy());
         assert!(!app.player.active);

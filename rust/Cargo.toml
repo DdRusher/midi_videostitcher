@@ -1,6 +1,6 @@
 [package]
 name = "midi-videostitcher-rust"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Native Chinese MIDI video stitcher with a Rust audio and scheduling core"
 license = "MIT"

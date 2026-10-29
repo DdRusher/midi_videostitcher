@@ -147,16 +147,19 @@ fn text(
                 .map(|c| scaled.h_advance(font.glyph_id(c)))
                 .sum();
         }
-        let mut pen = x as f32 + (width as f32 - extent) / 2.0;
-        let baseline = y as f32 + (height as f32 - scaled.height()) / 2.0 + scaled.ascent();
+        // Rasterize in the tile's coordinate system. Adding an integer screen
+        // offset before outlining can change f32 rounding and font coverage on
+        // some platforms, making the same tile depend on its grid position.
+        let mut pen = (width as f32 - extent) / 2.0;
+        let baseline = (height as f32 - scaled.height()) / 2.0 + scaled.ascent();
         for character in value.chars() {
             let id = font.glyph_id(character);
             let glyph = id.with_scale_and_position(scale, point(pen, baseline));
             if let Some(outline) = font.outline_glyph(glyph) {
                 let rect = outline.px_bounds();
                 outline.draw(|px, py, coverage| {
-                    let gx = rect.min.x as i32 + px as i32;
-                    let gy = rect.min.y as i32 + py as i32;
+                    let gx = x as i32 + rect.min.x as i32 + px as i32;
+                    let gy = y as i32 + rect.min.y as i32 + py as i32;
                     if gx >= 0 && gy >= 0 && gx < image.width() as i32 && gy < image.height() as i32
                     {
                         let pixel = image.get_pixel_mut(gx as u32, gy as u32);
@@ -419,8 +422,12 @@ fn labels(
     fs::write(&manifest, concat)?;
     let output = work.join("finished.mp4");
     let mut arguments = process::ffmpeg_args();
-    push(&mut arguments, &["-f", "concat", "-safe", "0", "-i"]);
-    push_path(&mut arguments, &manifest);
+    // Give concat a relative manifest URL. FFmpeg otherwise resolves its
+    // entries incorrectly when a Windows canonical path starts with \\?\.
+    push(
+        &mut arguments,
+        &["-f", "concat", "-safe", "0", "-i", "cards.ffconcat"],
+    );
     arguments.push("-i".into());
     push_path(&mut arguments, audio);
     push(
@@ -431,7 +438,7 @@ fn labels(
     process::encode(
         ffmpeg,
         &arguments,
-        None,
+        Some(&directory),
         &control.scoped(0.35, 1.0, ""),
         timeline.seconds(),
     )?;
@@ -880,8 +887,11 @@ fn legacy_clips(
     fs::write(&manifest, concat)?;
     let output = work.join("finished.mp4");
     let mut arguments = process::ffmpeg_args();
-    push(&mut arguments, &["-f", "concat", "-safe", "0", "-i"]);
-    push_path(&mut arguments, &manifest);
+    // Resolve segment filenames against this directory, not a \\?\ URL.
+    push(
+        &mut arguments,
+        &["-f", "concat", "-safe", "0", "-i", "segments.ffconcat"],
+    );
     arguments.push("-i".into());
     push_path(&mut arguments, audio);
     push(
@@ -907,7 +917,7 @@ fn legacy_clips(
     process::encode(
         ffmpeg,
         &arguments,
-        None,
+        Some(work),
         &control.scoped(0.9, 1.0, ""),
         timeline.seconds(),
     )?;
@@ -979,7 +989,16 @@ mod tests {
             &JobControl::default(),
         )
         .unwrap();
-        assert_eq!(cached, card(&options, &voices).unwrap());
+        let direct = card(&options, &voices).unwrap();
+        assert!(
+            cached.as_raw() == direct.as_raw(),
+            "cached and direct card pixels differ at byte {:?}",
+            cached
+                .as_raw()
+                .iter()
+                .zip(direct.as_raw())
+                .position(|(a, b)| a != b)
+        );
         let tiny = RenderOptions {
             width: 64,
             height: 64,
@@ -1002,5 +1021,130 @@ mod tests {
         let strong = card(&options, &[(60, 127)]).unwrap();
         let weak = card(&options, &[(60, 32)]).unwrap();
         assert_ne!(strong.as_raw(), weak.as_raw());
+    }
+    #[test]
+    fn low_cache_fallback_handles_canonical_unicode_paths_and_windowed_overlaps() {
+        let Ok(ffmpeg) = media::find_ffmpeg(None) else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let work = directory.path().join("原视频 拼接");
+        fs::create_dir(&work).unwrap();
+        // On Windows this deliberately exercises extended-length \\?\ paths.
+        let work = work.canonicalize().unwrap();
+        let source = work.join("C4.mkv");
+        let mut arguments = process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=64x64:r=20:d=1",
+            "-an",
+            "-c:v",
+            "ffv1",
+        ]);
+        push_path(&mut arguments, &source);
+        process::encode(&ffmpeg, &arguments, None, &JobControl::default(), 0.0).unwrap();
+        let data = crate::model::MidiData {
+            notes: vec![
+                crate::model::Note {
+                    pitch: 60,
+                    velocity: 127,
+                    start: 0.0,
+                    end: 1.0,
+                    track: 0,
+                    channel: 0,
+                    source_offset: 0.0,
+                },
+                crate::model::Note {
+                    pitch: 60,
+                    velocity: 100,
+                    start: 0.4,
+                    end: 0.8,
+                    track: 0,
+                    channel: 0,
+                    source_offset: 0.0,
+                },
+            ],
+            duration: 1.0,
+            tracks: vec![],
+            warnings: vec![],
+        };
+        let options = RenderOptions {
+            width: 64,
+            height: 64,
+            fps: 20,
+            visuals: VisualMode::Clips,
+            workers: 2,
+            ..Default::default()
+        };
+        let timeline = crate::timeline::build(&data, 20, options.chord).unwrap();
+        let infos = media::probe_many(&ffmpeg, &[source.clone()], &JobControl::default()).unwrap();
+        let assets = BTreeMap::from([(60, infos[&source].clone())]);
+        let windows = BTreeMap::from([(
+            60,
+            SourceWindow {
+                start: 0.2,
+                end: 0.8,
+            },
+        )]);
+        let audio = work.join("mix.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio, spec).unwrap();
+        for _ in 0..96000 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let result = legacy_clips(
+            &timeline,
+            &assets,
+            &windows,
+            &options,
+            &ffmpeg,
+            &work,
+            &audio,
+            &JobControl::default(),
+        )
+        .unwrap();
+        let verify = |result: &Path| {
+            let mut arguments = process::args(&["-v", "error", "-i"]);
+            push_path(&mut arguments, result);
+            push(
+                &mut arguments,
+                &[
+                    "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ],
+            );
+            let decoded =
+                process::run(&ffmpeg, &arguments, None, &JobControl::default(), 0.0).unwrap();
+            assert_eq!(
+                decoded.code,
+                0,
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert_eq!(decoded.stdout.len(), 20 * 64 * 64 * 3);
+        };
+        verify(&result);
+        // The image-card renderer uses another relative ffconcat manifest and
+        // must remain safe when overwriting output in a canonical directory.
+        let result = labels(
+            &timeline,
+            &options,
+            &ffmpeg,
+            &work,
+            &audio,
+            &JobControl::default(),
+        )
+        .unwrap();
+        verify(&result);
     }
 }

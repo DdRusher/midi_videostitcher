@@ -91,14 +91,7 @@ pub fn fingerprint(path: &Path) -> Result<String> {
     )
 }
 
-pub fn find_assets(
-    data: &MidiData,
-    directory: &Path,
-    allow_audio: bool,
-) -> Result<BTreeMap<u8, PathBuf>> {
-    if !directory.is_dir() {
-        bail!("素材文件夹不存在：{}", directory.display());
-    }
+fn asset_names(directory: &Path, allow_audio: bool) -> Result<BTreeMap<String, Vec<PathBuf>>> {
     let mut names: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
@@ -122,6 +115,27 @@ pub fn find_assets(
                 .push(path.canonicalize()?);
         }
     }
+    Ok(names)
+}
+
+pub fn find_assets(
+    data: &MidiData,
+    directory: &Path,
+    allow_audio: bool,
+) -> Result<BTreeMap<u8, PathBuf>> {
+    if !directory.is_dir() {
+        bail!("素材文件夹不存在：{}", directory.display());
+    }
+    let mut names = asset_names(directory, allow_audio)?;
+    // Distributed material packs keep the actual clips in `videos/`. Accept
+    // the pack root too, without mixing different folders or ambiguous files.
+    let packaged_videos = directory.join("videos");
+    let directory = if names.is_empty() && packaged_videos.is_dir() {
+        names = asset_names(&packaged_videos, allow_audio)?;
+        packaged_videos.as_path()
+    } else {
+        directory
+    };
     let pitches: BTreeSet<_> = data.notes.iter().map(|note| note.pitch).collect();
     let mut output = BTreeMap::new();
     let mut missing = Vec::new();
@@ -163,8 +177,8 @@ pub fn find_assets(
     }
     if !missing.is_empty() {
         bail!(
-            "缺少以下音符的素材：{}。例如 C4.mp4 或 60.wav。",
-            missing.join("、")
+            "缺少以下音符的素材：{}。\n检查的文件夹：{}\n请选择包含音名文件的视频目录，例如 C4.mp4 或 60.wav；素材包可直接选择根目录或 videos 子目录。",
+            missing.join("、"), directory.display()
         );
     }
     Ok(output)
@@ -438,5 +452,24 @@ mod tests {
             .to_string()
             .contains("C4"));
         assert_eq!(clock("00:01:02.125, bitrate: 128"), Some(62.125));
+    }
+    #[test]
+    fn material_pack_root_finds_videos_without_merging_other_folders() {
+        let temporary = tempfile::tempdir().unwrap();
+        let videos = temporary.path().join("videos");
+        fs::create_dir(&videos).unwrap();
+        fs::write(videos.join("C4.mp4"), []).unwrap();
+        let files = find_assets(&data(60), temporary.path(), true).unwrap();
+        assert_eq!(files[&60], videos.join("C4.mp4").canonicalize().unwrap());
+        fs::write(temporary.path().join("C4.wav"), []).unwrap();
+        let files = find_assets(&data(60), temporary.path(), true).unwrap();
+        assert_eq!(
+            files[&60],
+            temporary.path().join("C4.wav").canonicalize().unwrap()
+        );
+        let error = find_assets(&data(61), temporary.path(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("C#4") && error.contains(&temporary.path().display().to_string()));
     }
 }
