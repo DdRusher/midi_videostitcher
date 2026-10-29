@@ -53,6 +53,12 @@ fn primary_button(text: &str) -> egui::Button<'_> {
         .min_size(egui::vec2(122., 38.))
 }
 
+fn text_field(value: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(value)
+        .margin(egui::Margin::symmetric(10, 7))
+        .min_size(egui::vec2(0., 34.))
+}
+
 pub fn launch() -> eframe::Result<()> {
     launch_with_midi(None)
 }
@@ -106,7 +112,9 @@ fn install_fonts(ctx: &egui::Context) {
             break;
         }
     }
-    let mut style = (*ctx.style()).clone();
+    // eframe supplies the OS theme on its first input frame. Set both style
+    // slots explicitly, rather than styling whichever slot is active at startup.
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
     style.spacing.item_spacing = egui::vec2(9., 8.);
     style.spacing.button_padding = egui::vec2(13., 8.);
     style.spacing.interact_size.y = 34.;
@@ -147,7 +155,10 @@ fn install_fonts(ctx: &egui::Context) {
     visuals.hyperlink_color = BLUE;
     visuals.error_fg_color = Color32::from_rgb(187, 55, 71);
     style.visuals = visuals;
-    ctx.set_style(style);
+    let style = Arc::new(style);
+    ctx.set_style_of(egui::Theme::Light, style.clone());
+    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_theme(egui::Theme::Light);
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JobKind {
@@ -203,13 +214,9 @@ fn preview_key(data: &MidiData, options: &RenderOptions) -> Result<u64> {
     let paths = if let Some(path) = options.audio_path {
         vec![path]
     } else {
-        let mut paths = std::fs::read_dir(options.video_dir)
-            .context("无法读取素材目录。")?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths
+        crate::media::find_assets(data, &options.video_dir, true)?
+            .into_values()
+            .collect::<Vec<_>>()
     };
     for path in paths {
         absolute(&path).hash(&mut h);
@@ -1025,7 +1032,7 @@ impl StitcherApp {
             let mut path = self.midi_path.clone();
             if ui
                 .add(
-                    egui::TextEdit::singleline(&mut path)
+                    text_field(&mut path)
                         .desired_width((ui.available_width() - 112.).max(140.))
                         .hint_text("选择 .mid 或 .midi 文件"),
                 )
@@ -1049,7 +1056,7 @@ impl StitcherApp {
             let mut folder = self.video_dir.clone();
             if ui
                 .add(
-                    egui::TextEdit::singleline(&mut folder)
+                    text_field(&mut folder)
                         .desired_width((ui.available_width() - 112.).max(140.))
                         .hint_text("每个音高对应一个视频或音频素材"),
                 )
@@ -1162,12 +1169,12 @@ impl StitcherApp {
         ui.horizontal_wrapped(|ui| {
             ui.label("开始");
             changed |= ui
-                .add(egui::TextEdit::singleline(&mut self.start).desired_width(100.))
+                .add(text_field(&mut self.start).desired_width(100.))
                 .changed();
             ui.label("结束");
             changed |= ui
                 .add(
-                    egui::TextEdit::singleline(&mut self.end)
+                    text_field(&mut self.end)
                         .desired_width(100.)
                         .hint_text("留空为全曲"),
                 )
@@ -1415,14 +1422,12 @@ impl StitcherApp {
                         ui.checkbox(&mut self.material_random, "随机选段").changed();
                     ui.label("开始");
                     self.material_dirty |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.material_start).desired_width(80.),
-                        )
+                        .add(text_field(&mut self.material_start).desired_width(80.))
                         .changed();
                     ui.label("结束");
                     self.material_dirty |= ui
                         .add(
-                            egui::TextEdit::singleline(&mut self.material_end)
+                            text_field(&mut self.material_end)
                                 .desired_width(100.)
                                 .hint_text("留空为末尾"),
                         )
@@ -1524,8 +1529,7 @@ impl StitcherApp {
                 ui.label("音乐文件");
                 changed |= ui
                     .add(
-                        egui::TextEdit::singleline(&mut self.audio_path)
-                            .desired_width(ui.available_width() - 115.),
+                        text_field(&mut self.audio_path).desired_width(ui.available_width() - 115.),
                     )
                     .changed();
                 if ui.button("选择音频").clicked() {
@@ -1621,7 +1625,7 @@ impl StitcherApp {
                     .unwrap_or_default();
                 if ui
                     .add(
-                        egui::TextEdit::singleline(&mut value)
+                        text_field(&mut value)
                             .desired_width(280.)
                             .hint_text("自动查找，可留空"),
                     )
@@ -1650,7 +1654,7 @@ impl StitcherApp {
         ui.strong("MP4 保存位置");
         ui.horizontal(|ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.output_path)
+                text_field(&mut self.output_path)
                     .desired_width((ui.available_width() - 112.).max(140.))
                     .hint_text("选择成片的保存位置"),
             );
@@ -2246,6 +2250,66 @@ mod tests {
         options.velocity = true;
         std::fs::write(source, b"updated longer").unwrap();
         assert_ne!(first, preview_key(&data, &options).unwrap());
+    }
+    #[test]
+    fn preview_cache_follows_actual_materials_inside_packaged_videos() {
+        let directory = tempfile::tempdir().unwrap();
+        let videos = directory.path().join("videos");
+        std::fs::create_dir(&videos).unwrap();
+        let source = videos.join("C4.wav");
+        std::fs::write(&source, b"first material").unwrap();
+        std::fs::write(videos.join("E4.wav"), b"another material").unwrap();
+        let app = loaded_app(directory.path());
+        let data = app.data.as_ref().unwrap();
+        let options = RenderOptions {
+            video_dir: directory.path().into(),
+            ..Default::default()
+        };
+        let first = preview_key(data, &options).unwrap();
+        std::fs::write(
+            directory.path().join("README.txt"),
+            b"unrelated description",
+        )
+        .unwrap();
+        assert_eq!(first, preview_key(data, &options).unwrap());
+        std::fs::write(source, b"updated and longer actual material").unwrap();
+        assert_ne!(first, preview_key(data, &options).unwrap());
+    }
+    #[test]
+    fn workbench_theme_survives_first_frame_and_os_theme_changes() {
+        let context = egui::Context::default();
+        context.set_theme(egui::ThemePreference::System);
+        install_fonts(&context);
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let style = context.style_of(theme);
+            assert_eq!(style.visuals.selection.bg_fill, BLUE);
+            assert_eq!(style.spacing.interact_size.y, 34.);
+        }
+        for system_theme in [egui::Theme::Light, egui::Theme::Dark, egui::Theme::Light] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(880., 680.),
+                    )),
+                    system_theme: Some(system_theme),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert_eq!(ctx.system_theme(), Some(system_theme));
+                    assert_eq!(ctx.theme(), egui::Theme::Light);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(!ui.visuals().dark_mode);
+                        assert_eq!(ui.visuals().selection.bg_fill, BLUE);
+                        assert_eq!(ui.visuals().widgets.inactive.bg_stroke.color, BORDER);
+                        assert_eq!(ui.style().text_styles[&egui::TextStyle::Button].size, 15.);
+                        let mut text = String::new();
+                        assert!(ui.add(text_field(&mut text)).rect.height() >= 34.);
+                        assert!(ui.button("选择 MIDI").rect.height() >= 34.);
+                    });
+                },
+            );
+        }
     }
     #[test]
     fn time_boundary_does_not_round_past_end() {
