@@ -1,5 +1,7 @@
 # Rust 原生版本
 
+**下载成品与第一次使用：** [Rust v0.5.2 Release](https://github.com/DdRusher/midi_videostitcher/releases/tag/rust-v0.5.2) · [Windows 使用指南](docs/WINDOWS-使用指南.md)。指南包含运行库与 FFmpeg 配置、11 秒测试、素材命名、试听导出和常见报错；无需先编译源码。
+
 这是独立的 Rust 中文桌面程序，包含原生窗口、MIDI 解析、选区与素材安排、音频混合、画面生成和命令行入口。Rust 程序不调用 Python；仓库内原 Python v0.4 源码保留作对照。
 
 v0.5.2 默认按音符自身的结束时间同时关闭视频与声音，仅在真实重叠的区间分屏。需要踏板延音时，手动勾选“跟随延音踏板”，命令行使用 `--sustain`。素材混音会在音符起止与循环接缝做短暂平滑，减少直接截断波形带来的点击声；平滑收尾在音符结束前完成，不延长播放。
@@ -10,7 +12,11 @@ v0.5.1 改为浅色分步工作台，并修复 Windows 扩展路径导致 FFmpeg
 
 ## Windows 使用
 
+完整逐步操作说明见 [Windows 使用指南](docs/WINDOWS-使用指南.md)。从发布页下载 **midi_videostitcher-rust-0.5.2-windows.zip**；不要把自动生成的 Source code ZIP 当成可直接启动的程序包。
+
 解压应用包，双击 `start.bat` 或 `native/midi-videostitcher.exe`。不需要安装 Python、NumPy、Pillow 或 Rust 编译器。
+
+本次发布包面向 Windows 10/11 x64，需要微软 Visual C++ v14 x64 运行库；如果双击无窗口或提示缺少 `VCRUNTIME140.dll`，请按指南安装 [微软官方运行库](https://aka.ms/vc14/vc_redist.x64.exe) 后重试。
 
 程序会查找同目录或 PATH 中的 FFmpeg，也可以在窗口里指定 `ffmpeg.exe`。没有 FFmpeg 时会明确提示；它负责视频编解码与最终音频限幅。
 

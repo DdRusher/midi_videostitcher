@@ -1,5 +1,7 @@
 # MIDI 视频拼接器 · Rust 分支
 
+**直接使用 Windows 程序：** [下载 Rust v0.5.2 Release](https://github.com/DdRusher/midi_videostitcher/releases/tag/rust-v0.5.2) → 下载 Assets 中的 Windows 程序 ZIP → 解压并双击 `start.bat`。先按 [Windows 使用指南](docs/WINDOWS-使用指南.md) 准备运行库和 FFmpeg，即可用附带测试 MIDI 的正弦素材包跑通一次。运行成品不需要 Python 或 Rust；Source code 下载项不包含编译好的程序。
+
 本分支提供 **Rust 原生中文桌面程序、MIDI 解析、并行音频混合与视频合成**，运行不需要 Python。Windows 应用包解压后双击 `start.bat` 或 `native/midi-videostitcher.exe`；源码构建、算法和测试说明见 [README-RUST.md](README-RUST.md)。
 
 Rust 源码位于 `rust/`，支持原声分屏、音名/频率/力度画面、固定与随机素材选段、选区试听、WAV 导出及导入完整音乐。FFmpeg 负责媒体编解码。
